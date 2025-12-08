@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+dataset
+checkpoints/
+generated_samples/
+._*
