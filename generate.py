@@ -1,11 +1,23 @@
 import torch
+import torch.nn.functional as F
 import os
+import json
 from model import MusicTransformerVAE, generate_square_subsequent_mask
 from miditok import REMI, TokenizerConfig
 import argparse
 from symusic import Score
 from dataset import STYLES, UNKNOWN_STYLE_IDX
 from pathlib import Path
+from miditok import MusicTokenizer
+
+# Monkey patch MusicTokenizer.__getitem__ to handle tuple indices
+# This fixes a KeyError: (track, token) issue in some miditok versions
+original_getitem = MusicTokenizer.__getitem__
+def patched_getitem(self, item):
+    if isinstance(item, tuple):
+        return original_getitem(self, item[1])
+    return original_getitem(self, item)
+MusicTokenizer.__getitem__ = patched_getitem
 
 
 def generate(args):
@@ -22,7 +34,7 @@ def generate(args):
         config = TokenizerConfig(
             num_velocities=16,
             use_chords=False,
-            use_programs=True,
+            use_programs=False, # Match dataset config
             use_rests=True,
             use_tempos=True,
             use_time_signatures=True
@@ -34,9 +46,62 @@ def generate(args):
             print(f"Loading tokenizer from {args.tokenizer_path}")
             try:
                 tokenizer = REMI.from_pretrained(args.tokenizer_path)
-            except:
-                print(
-                    f"Could not load from {args.tokenizer_path}, using default config")
+            except Exception as e:
+                print(f"Could not use from_pretrained: {e}")
+                print("Attempting manual config load...")
+                try:
+                    with open(args.tokenizer_path, 'r') as f:
+                        data = json.load(f)
+                    
+                    config_dict = data['config']
+                    
+                    # Fix beat_res keys
+                    if 'beat_res' in config_dict:
+                        new_beat_res = {}
+                        for k, v in config_dict['beat_res'].items():
+                            if isinstance(k, str) and '_' in k:
+                                parts = k.split('_')
+                                try:
+                                    key = (int(parts[0]), int(parts[1]))
+                                    new_beat_res[key] = v
+                                except:
+                                    new_beat_res[k] = v
+                            else:
+                                new_beat_res[k] = v
+                        config_dict['beat_res'] = new_beat_res
+
+                    # Fix beat_res_rest keys
+                    if 'beat_res_rest' in config_dict:
+                        new_beat_res_rest = {}
+                        for k, v in config_dict['beat_res_rest'].items():
+                            if isinstance(k, str) and '_' in k:
+                                parts = k.split('_')
+                                try:
+                                    key = (int(parts[0]), int(parts[1]))
+                                    new_beat_res_rest[key] = v
+                                except:
+                                    new_beat_res_rest[k] = v
+                            else:
+                                new_beat_res_rest[k] = v
+                        config_dict['beat_res_rest'] = new_beat_res_rest
+
+                    # Fix time_signature_range keys
+                    if 'time_signature_range' in config_dict:
+                        new_ts = {}
+                        for k, v in config_dict['time_signature_range'].items():
+                            try:
+                                key = int(k)
+                                new_ts[key] = v
+                            except:
+                                new_ts[k] = v
+                        config_dict['time_signature_range'] = new_ts
+
+                    config = TokenizerConfig(**config_dict)
+                    tokenizer = REMI(config)
+                    print("✓ Loaded tokenizer from manual config parse")
+                except Exception as e2:
+                    print(f"Manual load failed: {e2}")
+                    raise e2
         else:
             print(
                 f"Tokenizer file not found at {args.tokenizer_path}, using default config")
@@ -45,7 +110,7 @@ def generate(args):
         config = TokenizerConfig(
             num_velocities=16,
             use_chords=False,
-            use_programs=True,
+            use_programs=False,
             use_rests=True,
             use_tempos=True,
             use_time_signatures=True
@@ -77,6 +142,7 @@ def generate(args):
         num_layers = train_args.get('num_layers', args.num_layers)
         latent_dim = train_args.get('latent_dim', args.latent_dim)
         max_seq_len = train_args.get('seq_len', args.seq_len)
+        num_memory_tokens = train_args.get('num_memory_tokens', 4)  # Default to 4 (new architecture)
     else:
         print("No training arguments found in checkpoint, using command line arguments.")
         d_model = args.d_model
@@ -84,6 +150,7 @@ def generate(args):
         num_layers = args.num_layers
         latent_dim = args.latent_dim
         max_seq_len = args.seq_len
+        num_memory_tokens = 4  # Default
 
     # Load Model
     model = MusicTransformerVAE(
@@ -94,7 +161,8 @@ def generate(args):
         num_decoder_layers=num_layers,
         latent_dim=latent_dim,
         max_seq_len=max_seq_len,
-        num_styles=num_styles
+        num_styles=num_styles,
+        num_memory_tokens=num_memory_tokens
     ).to(device)
 
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -122,6 +190,38 @@ def generate(args):
         style_id = UNKNOWN_STYLE_IDX
 
     style_tensor = torch.tensor([style_id], dtype=torch.long, device=device)
+    
+    # Prepare bar count and calculate target length
+    bar_count = max(2, min(32, args.num_bars))  # Clamp to 2-32
+    bar_tensor = torch.tensor([bar_count], dtype=torch.long, device=device)
+    print(f"Conditioning on {bar_count} bars")
+    
+    # Get predicted length from model (if available)
+    with torch.no_grad():
+        bar_emb = model.bar_embedding(bar_tensor)  # [1, d_model]
+        length_input = torch.cat([z, bar_emb], dim=1)  # [1, latent_dim + d_model]
+        predicted_length_normalized = model.length_predictor(length_input).item()  # Scalar in [0, 1]
+        
+        # Convert normalized prediction to actual token count
+        # Predicted length is fraction of max_seq_len
+        predicted_tokens = int(predicted_length_normalized * max_seq_len)
+        print(f"Model predicted length: {predicted_tokens} tokens ({predicted_length_normalized:.3f} of max_seq_len {max_seq_len})")
+    
+    # Load tokens-per-bar statistics for fallback
+    try:
+        with open('tokens_per_bar_stats.json', 'r') as f:
+            tpb_stats = json.load(f)
+        mean_tokens_per_bar = tpb_stats['mean_tokens_per_bar']
+        statistical_estimate = int(bar_count * mean_tokens_per_bar)
+        print(f"Statistical estimate: {statistical_estimate} tokens ({mean_tokens_per_bar:.1f} tokens/bar)")
+        
+        # Use model prediction if available, otherwise use statistical estimate
+        target_seq_len = predicted_tokens if predicted_tokens > 0 else statistical_estimate
+    except FileNotFoundError:
+        print("Warning: tokens_per_bar_stats.json not found, using model prediction only")
+        target_seq_len = predicted_tokens if predicted_tokens > 0 else args.seq_len
+    
+    print(f"Target sequence length: {target_seq_len} tokens")
 
     # Get BOS (Beginning of Sequence) token from tokenizer
     # miditok 3.x may not have explicit BOS, so we'll use a safe default
@@ -171,13 +271,13 @@ def generate(args):
             print(f"WARNING: Failed to set tempo: {e}")
 
     with torch.no_grad():
-        for _ in range(args.seq_len):
+        for _ in range(target_seq_len):  # Use calculated target length
             seq_len = generated.size(0)
             tgt_mask = generate_square_subsequent_mask(seq_len).to(device)
 
             # Decode
             logits = model.decode(
-                generated, z, style_id=style_tensor, tgt_mask=tgt_mask)
+                z, generated, style_id=style_tensor, bar_id=bar_tensor, tgt_mask=tgt_mask)
 
             # Get last token logits
             last_logits = logits[-1, :]
@@ -214,13 +314,29 @@ def generate(args):
 
     try:
         # Decode tokens to MIDI using miditok 3.x
-        midi = tokenizer.decode(tokens)
+        # miditok 3.x decode expects tokens wrapped in proper format
+        from miditok import TokSequence
+        
+        # Create TokSequence object
+        # If one_token_stream is True, we need to wrap tokens appropriately
+        if hasattr(tokenizer, 'one_token_stream') and tokenizer.one_token_stream:
+            # For single stream tokenizers
+            tok_seq = TokSequence(ids=tokens)
+            midi = tokenizer.decode([tok_seq])
+        else:
+            # Try direct decode first (fallback)
+            try:
+                tok_seq = TokSequence(ids=tokens)
+                midi = tokenizer.decode([tok_seq])
+            except:
+                # Last resort: direct list decode
+                midi = tokenizer.decode([tokens])
 
         # Post-processing: Merge all tracks into a single Piano track
         # This addresses the "16 different midi channels" issue
         if args.single_track and len(midi.tracks) > 0:
             print(
-                f"Merging {len(midi.tracks)} tracks into a single Piano track...")
+                f"Merging {len(midi.tracks)} tracks into a single Drum track...")
             all_notes = []
             for track in midi.tracks:
                 all_notes.extend(track.notes)
@@ -230,9 +346,9 @@ def generate(args):
 
             # Use the first track as the container
             main_track = midi.tracks[0]
-            main_track.program = 0  # Force Piano
-            main_track.is_drum = False
-            main_track.name = "Generated Piano"
+            main_track.program = 0 
+            main_track.is_drum = True # DRUMS
+            main_track.name = "Generated Drums"
             main_track.notes = all_notes
 
             # Replace tracks list with just the main track
@@ -291,6 +407,8 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--style", type=str, default=None,
                         help="Style to generate")
+    parser.add_argument("--num_bars", type=int, default=8,
+                        help="Number of bars to generate (2-32)")
     parser.add_argument("--single_track", action="store_true",
                         help="Merge all tracks into a single piano track (default: False, keep original tracks)")
     parser.add_argument("--tempo", type=int, default=None,

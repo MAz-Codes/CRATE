@@ -7,7 +7,9 @@ The core model is a **MusicTransformerVAE**, combining:
 3.  **Transformer Decoder**: Reconstructs the sequence from the latent vector $z$ and conditioning information (Style, Tempo).
 
 ### Conditioning
-The model uses **Style Embeddings** to guide generation. A style ID (e.g., for "Funk") is embedded and added to the decoder's input, forcing the model to adopt the rhythm and velocity characteristics of that genre.
+The model uses **Style Embeddings** and **Bar Count Embeddings** to guide generation:
+- **Style ID** (e.g., "Funk"): Embedded and added to decoder input, forcing the model to adopt genre-specific rhythm and velocity characteristics
+- **Bar Count** (2-32 bars): Embedded and added to decoder input, teaching the model to generate sequences of specific lengths
 
 ## Training Process
 - **Objective**: Optimize the Evidence Lower Bound (ELBO), consisting of:
@@ -26,5 +28,5 @@ The model uses **Style Embeddings** to guide generation. A style ID (e.g., for "
 ## Generating
 During inference (`generate.py`), we:
 1.  Sample a random latent vector $z \sim \mathcal{N}(0, I)$.
-2.  Provide a Style ID.
-3.  Decode auto-regressively to produce a new MIDI file.
+2.  Provide a Style ID and Bar Count.
+3.  Decode auto-regressively to produce a new MIDI file of the specified length.

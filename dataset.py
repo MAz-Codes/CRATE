@@ -10,6 +10,7 @@ import numpy as np
 import tensorflow_datasets as tfds
 import tensorflow as tf
 import tempfile
+import json
 
 # Define supported styles for mapping
 # Define supported styles from Groove MIDI Dataset
@@ -20,14 +21,40 @@ STYLE_TO_IDX = {style: i for i, style in enumerate(STYLES)}
 UNKNOWN_STYLE_IDX = len(STYLES)
 
 class GrooveMidiDataset(Dataset):
-    def __init__(self, split='train', max_seq_len=1024, max_examples=None):
+    def __init__(self, split='train', max_seq_len=1024, max_examples=None, use_bar_filter=False):
         self.max_seq_len = max_seq_len
         self.split = split
         
+        # Load bar counts (optional)
+        # Bar counts are not critical for model functionality
+        bar_counts_file = 'bar_counts_filtered.json' if use_bar_filter else 'bar_counts.json'
+        bar_counts_path = os.path.join(os.path.dirname(__file__), bar_counts_file)
+        
+        self.bar_counts = {}
+        if os.path.exists(bar_counts_path):
+            try:
+                with open(bar_counts_path, 'r') as f:
+                    self.bar_counts = json.load(f)
+                print(f"Loaded bar counts from {bar_counts_file}")
+            except Exception as e:
+                print(f"Note: Could not load bar counts ({e}). Using default value of 8 bars.")
+
+        # Initialize Tokenizer (miditok 3.x)
+        # Optimized for Drums: No chords, no programs (single instrument implied)
+        config = TokenizerConfig(
+            num_velocities=16,
+            use_chords=False,
+            use_programs=False, # Drums don't need program changes for this VAE
+            use_rests=True,
+            use_tempos=True,
+            use_time_signatures=True
+        )
+        self.tokenizer = REMI(config)
+        
         print(f"Loading Groove MIDI Dataset (split: {split})...")
-        # Load the full dataset (MIDI only)
-        # tfds.load returns a tf.data.Dataset
         data_dir = os.path.join(os.path.dirname(__file__), 'dataset')
+        
+        # Load the dataset
         ds, info = tfds.load(
             name="groove/full-midionly",
             split=split,
@@ -36,92 +63,99 @@ class GrooveMidiDataset(Dataset):
             data_dir=data_dir
         )
         
-        # Get style mapping from info
         self.style_primary_feature = info.features['style']['primary']
-        
-        # Convert to list for random access (GMD is small ~1150 samples total)
-        # This allows us to use PyTorch's generic DataLoader shuffling easily
         self.examples = []
+        
+        # Pre-process loop to tokenize and chunk
+        print(f"Processing and chunking {split} data...")
         for example in tqdm(ds, desc=f"Loading GMD {split}"):
-            # Style is returned as int (ClassLabel)
-            style_int = example['style']['primary'].numpy()
-            style_name = self.style_primary_feature.int2str(style_int)
-            
-            self.examples.append({
-                'midi': example['midi'].numpy(),
-                'style': style_name,
-                'bpm': int(example['bpm'].numpy()),
-                'id': example['id'].numpy().decode('utf-8')
-            })
+            try:
+                example_id = example['id'].numpy().decode('utf-8')
+                
+                if use_bar_filter and example_id not in self.bar_counts:
+                    continue
+                
+                # Get Style
+                style_int = example['style']['primary'].numpy()
+                style_name = self.style_primary_feature.int2str(style_int)
+                style_id = STYLE_TO_IDX.get(style_name.lower(), UNKNOWN_STYLE_IDX)
+                
+                # Get Metadata
+                bpm = int(example['bpm'].numpy())
+                # Default to 8 bars if not in bar_counts (safe fallback)
+                total_bars = self.bar_counts.get(example_id, 8)
+
+                # Load MIDI directly from bytes
+                midi_bytes = example['midi'].numpy()
+                score = Score.from_midi(midi_bytes)
+
+                # Tokenize
+                tokens = self.tokenizer.encode(score)
+                
+                # Extract IDs
+                token_ids = []
+                if isinstance(tokens, list) and len(tokens) > 0:
+                    if hasattr(tokens[0], 'ids'):
+                        token_ids = tokens[0].ids
+                    elif isinstance(tokens[0], int):
+                        token_ids = tokens
+                elif hasattr(tokens, 'ids'):
+                    token_ids = tokens.ids
+                
+                if len(token_ids) == 0:
+                    continue
+
+                # CHUNKING STRATEGY
+                # Split long sequences into chunks of max_seq_len with some overlap or just simple tiling
+                # For VAEs, discrete chunks are usually fine.
+                
+                chunk_size = self.max_seq_len
+                
+                # If sequence is short enough, just use it
+                if len(token_ids) <= chunk_size:
+                    self.examples.append({
+                        'input_ids': torch.tensor(token_ids, dtype=torch.long),
+                        'style_id': style_id,
+                        'num_bars': total_bars, # This is approximate for chunks, but acceptable for now
+                        'id': example_id
+                    })
+                else:
+                    # Split into chunks
+                    # We create multiple examples from one file
+                    # We stride by chunk_size (no overlap) to maximize unique data
+                    for i in range(0, len(token_ids), chunk_size):
+                        chunk = token_ids[i : i + chunk_size]
+                        
+                        # Discard very short last chunks (e.g. < 50 tokens) to avoid noise
+                        if len(chunk) < 50:
+                            continue
+                            
+                        self.examples.append({
+                            'input_ids': torch.tensor(chunk, dtype=torch.long),
+                            'style_id': style_id,
+                            'num_bars': total_bars, # TODO: We technically should re-calc bars for the chunk
+                            'id': f"{example_id}_chunk_{i//chunk_size}"
+                        })
+
+            except Exception as e:
+                # print(f"Error processing {example_id}: {e}")
+                continue
             
         if max_examples:
             self.examples = self.examples[:max_examples]
             
-        print(f"Loaded {len(self.examples)} examples.")
-
-        # Initialize Tokenizer (miditok 3.x)
-        # Note: Groove MIDI acts as a drum track (Channel 10 usually)
-        config = TokenizerConfig(
-            num_velocities=16,
-            use_chords=False, # Drums usually don't need chord tokens in the same way, but REMI uses them. 
-                              # We'll keep settings close to original but disable unnecessary ones if possible.
-                              # Actually, keeping it consistent with the model's expectation is safer for now.
-            use_programs=True, 
-            use_rests=True, # Drums have lots of silence
-            use_tempos=True,
-            use_time_signatures=True
-        )
-        self.tokenizer = REMI(config)
+        print(f"Processed {len(self.examples)} training sequences.")
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
         example = self.examples[idx]
-        midi_bytes = example['midi']
-        style_name = example['style']
-        
-        # Map style
-        # GMD styles might differ, simple mapping for now
-        # GMD styles: 'rock', 'funk', 'jazz', etc.
-        style_id = STYLE_TO_IDX.get(style_name.lower(), UNKNOWN_STYLE_IDX)
-        
-        try:
-            # miditok/symusic usually requires a file path. 
-            # We'll write to a temp file.
-            with tempfile.NamedTemporaryFile(suffix='.mid',  delete=True) as tmp:
-                tmp.write(midi_bytes)
-                tmp.flush()
-                
-                # Load MIDI
-                midi = Score(tmp.name)
-
-            # Tokenize
-            tokens = self.tokenizer.encode(midi)
-            
-            token_ids = []
-            if isinstance(tokens, list): # Handle legacy/complex returns
-                 if len(tokens) > 0:
-                    if hasattr(tokens[0], 'ids'):
-                         token_ids = tokens[0].ids
-                    elif isinstance(tokens[0], int):
-                        token_ids = tokens
-            elif hasattr(tokens, 'ids'):
-                 token_ids = tokens.ids
-
-            if len(token_ids) == 0:
-                # print(f"WARNING: Zero tokens for {example['id']}")
-                return torch.tensor([], dtype=torch.long), torch.tensor(style_id, dtype=torch.long)
-
-            # Truncate
-            if len(token_ids) > self.max_seq_len:
-                token_ids = token_ids[:self.max_seq_len]
-
-            return torch.tensor(token_ids, dtype=torch.long), torch.tensor(style_id, dtype=torch.long)
-
-        except Exception as e:
-            print(f"ERROR processing {example['id']}: {e}")
-            return torch.tensor([], dtype=torch.long), torch.tensor(style_id, dtype=torch.long)
+        return (
+            example['input_ids'], 
+            torch.tensor(example['style_id'], dtype=torch.long), 
+            torch.tensor(example['num_bars'], dtype=torch.long)
+        )
 
 # Keep the old class for valid reference but prevent its usage errors if dependencies are missing
 class MidiDataset(Dataset):
@@ -151,11 +185,11 @@ class DataCollator:
         # Filter out empty tensors (first element of tuple is empty)
         batch = [item for item in batch if item[0].numel() > 0]
         if len(batch) == 0:
-            return None, None, None
+            return None, None, None, None
 
 
         # Unzip
-        seqs, styles = zip(*batch)
+        seqs, styles, num_bars = zip(*batch)
 
         # Pad sequences
         src_batch = torch.nn.utils.rnn.pad_sequence(
@@ -164,7 +198,8 @@ class DataCollator:
         # Create masks
         src_key_padding_mask = (src_batch == self.pad_token_id).transpose(0, 1)
 
-        # Stack styles
+        # Stack styles and bar counts
         style_batch = torch.stack(styles)
+        bar_batch = torch.stack(num_bars)
 
-        return src_batch, src_key_padding_mask, style_batch
+        return src_batch, src_key_padding_mask, style_batch, bar_batch

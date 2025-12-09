@@ -4,4 +4,5 @@ __pycache__/
 dataset
 checkpoints/
 generated_samples/
+checkpoints_clean
 ._*

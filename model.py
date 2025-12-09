@@ -25,17 +25,19 @@ class PositionalEncoding(nn.Module):
 
 class MusicTransformerVAE(nn.Module):
     def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=6,
-                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1, latent_dim=256, max_seq_len=1024, num_styles=12):
+                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1, latent_dim=256, max_seq_len=1024, num_styles=12, num_bar_classes=33, num_memory_tokens=4):
         super(MusicTransformerVAE, self).__init__()
 
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.latent_dim = latent_dim
         self.max_seq_len = max_seq_len
+        self.num_memory_tokens = num_memory_tokens
 
         # Embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.style_embedding = nn.Embedding(num_styles, d_model)
+        self.bar_embedding = nn.Embedding(num_bar_classes, d_model)  # Bar count conditioning
         self.pos_encoder = PositionalEncoding(
             d_model, dropout, max_len=max_seq_len)
 
@@ -52,8 +54,8 @@ class MusicTransformerVAE(nn.Module):
         self.fc_mu = nn.Linear(d_model, latent_dim)
         self.fc_var = nn.Linear(d_model, latent_dim)
 
-        # Project latent back to d_model for decoder memory
-        self.fc_z_to_memory = nn.Linear(latent_dim, d_model)
+        # Project latent back to d_model for decoder memory (multiple tokens for stronger bottleneck)
+        self.fc_z_to_memory = nn.Linear(latent_dim, d_model * num_memory_tokens)
 
         # Decoder
         decoder_layers = nn.TransformerDecoderLayer(
@@ -63,6 +65,18 @@ class MusicTransformerVAE(nn.Module):
 
         # Output projection
         self.output_layer = nn.Linear(d_model, vocab_size)
+        
+        # Length prediction head (predicts sequence length from latent + bar embedding)
+        # Output is normalized to [0, 1] range (fraction of max_seq_len)
+        self.length_predictor = nn.Sequential(
+            nn.Linear(latent_dim + d_model, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),  # Predict single value: sequence length
+            nn.Sigmoid()  # Normalize to [0, 1] range
+        )
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -108,38 +122,87 @@ class MusicTransformerVAE(nn.Module):
 
         return mu, logvar
 
-    def decode(self, tgt, z, style_id=None, tgt_mask=None, tgt_key_padding_mask=None):
-        # tgt: [seq_len, batch_size]
-        # z: [batch_size, latent_dim]
+    def decode(self, z, tgt, style_id=None, bar_id=None, tgt_key_padding_mask=None, tgt_mask=None, use_latent_dropout=False):
+        """
+        Decode from latent z to output sequence.
+        Args:
+            z: latent vector [batch_size, latent_dim]
+            tgt: target tokens [seq_len, batch_size]
+            style_id: style conditioning [batch_size]
+            bar_id: bar count conditioning [batch_size]
+            tgt_key_padding_mask: padding mask for target
+            tgt_mask: causal mask for target
+            use_latent_dropout: if True, randomly zero out z during training (10% chance)
+        """
+        # Latent dropout: force decoder to be robust to missing latent information
+        if use_latent_dropout and self.training:
+            dropout_mask = torch.bernoulli(torch.full((z.size(0), 1), 0.9, device=z.device))
+            z = z * dropout_mask
+        
+        # Project z to multiple memory tokens for stronger latent bottleneck
+        batch_size = z.size(0)
+        memory = self.fc_z_to_memory(z).view(batch_size, self.num_memory_tokens, self.d_model)
+        memory = memory.transpose(0, 1)  # [num_memory_tokens, batch_size, d_model]
 
-        # Project z to be the "memory" for the decoder
-        # memory shape: [1, batch_size, d_model] (sequence length of 1)
-        memory = self.fc_z_to_memory(z).unsqueeze(0)
-
-        # Add Style Embedding to memory
-        if style_id is not None:
-            style_emb = self.style_embedding(style_id).unsqueeze(0)
-            memory = memory + style_emb
-
+        # Embed target tokens
         tgt_emb = self.embedding(tgt) * math.sqrt(self.d_model)
+        
+        # Add style embedding if provided
+        if style_id is not None:
+            style_emb = self.style_embedding(style_id)  # [batch_size, d_model]
+            tgt_emb = tgt_emb + style_emb.unsqueeze(0)  # Broadcast to [seq_len, batch_size, d_model]
+        
+        # Add bar embedding if provided
+        if bar_id is not None:
+            bar_emb = self.bar_embedding(bar_id)  # [batch_size, d_model]
+            tgt_emb = tgt_emb + bar_emb.unsqueeze(0)  # Broadcast to [seq_len, batch_size, d_model]
+        
         tgt_emb = self.pos_encoder(tgt_emb)
 
+        # Decode
         output = self.transformer_decoder(
-            tgt_emb, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+            tgt_emb, memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask
+        )
+
+        # Project to vocabulary
         logits = self.output_layer(output)
         return logits
 
-    def forward(self, src, tgt, style_id=None, src_key_padding_mask=None, tgt_key_padding_mask=None, tgt_mask=None):
-        # src: [src_len, batch_size]
-        # tgt: [tgt_len, batch_size] (usually src shifted by 1 for teacher forcing)
-
+    def forward(self, src, tgt, style_id=None, bar_id=None, src_key_padding_mask=None, tgt_key_padding_mask=None, tgt_mask=None):
+        """
+        Forward pass through the VAE.
+        Args:
+            src: source tokens [seq_len, batch_size]
+            tgt: target tokens [seq_len, batch_size]
+            style_id: style conditioning [batch_size]
+            bar_id: bar count conditioning [batch_size]
+        """
+        # Encode
         mu, logvar = self.encode(
-            src, style_id=style_id, src_key_padding_mask=src_key_padding_mask)
-        z = self.reparameterize(mu, logvar)
-        logits = self.decode(tgt, z, style_id=style_id, tgt_mask=tgt_mask,
-                             tgt_key_padding_mask=tgt_key_padding_mask)
+            src, src_key_padding_mask=src_key_padding_mask)
 
-        return logits, mu, logvar
+        # Reparameterize
+        z = self.reparameterize(mu, logvar)
+        
+        # Predict length from latent and bar embedding
+        if bar_id is not None:
+            bar_emb = self.bar_embedding(bar_id)  # [batch_size, d_model]
+            length_input = torch.cat([z, bar_emb], dim=1)  # [batch_size, latent_dim + d_model]
+            predicted_length = self.length_predictor(length_input).squeeze(-1)  # [batch_size]
+        else:
+            predicted_length = None
+
+        # Decode (with latent dropout during training)
+        logits = self.decode(
+            z, tgt, style_id=style_id, bar_id=bar_id,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            tgt_mask=tgt_mask,
+            use_latent_dropout=True  # Enable latent dropout during training
+        )
+
+        return logits, mu, logvar, predicted_length
 
 
 def generate_square_subsequent_mask(sz):
