@@ -68,6 +68,13 @@ class GrooveMidiDataset(Dataset):
         
         # Pre-process loop to tokenize and chunk
         print(f"Processing and chunking {split} data...")
+        
+        # Get Bar token ID for counting bars in chunks
+        try:
+            bar_token_id = self.tokenizer["Bar_None"]
+        except:
+            bar_token_id = -1 # Fallback
+
         for example in tqdm(ds, desc=f"Loading GMD {split}"):
             try:
                 example_id = example['id'].numpy().decode('utf-8')
@@ -111,12 +118,25 @@ class GrooveMidiDataset(Dataset):
                 
                 chunk_size = self.max_seq_len
                 
+                # Calculate average tokens per bar for this file
+                avg_tokens_per_bar = len(token_ids) / max(1, total_bars)
+
                 # If sequence is short enough, just use it
                 if len(token_ids) <= chunk_size:
+                    # Recalculate bars for short sequences too (sometimes metadata is wrong)
+                    actual_bars = total_bars
+                    if bar_token_id != -1:
+                        count = token_ids.count(bar_token_id)
+                        if count > 0:
+                            actual_bars = count
+                        else:
+                            # Estimate
+                            actual_bars = max(1, int(len(token_ids) / avg_tokens_per_bar))
+
                     self.examples.append({
                         'input_ids': torch.tensor(token_ids, dtype=torch.long),
                         'style_id': style_id,
-                        'num_bars': total_bars, # This is approximate for chunks, but acceptable for now
+                        'num_bars': actual_bars,
                         'id': example_id
                     })
                 else:
@@ -129,11 +149,20 @@ class GrooveMidiDataset(Dataset):
                         # Discard very short last chunks (e.g. < 50 tokens) to avoid noise
                         if len(chunk) < 50:
                             continue
-                            
+                        
+                        # Calculate actual bars in this chunk
+                        chunk_bars = 0
+                        if bar_token_id != -1:
+                            chunk_bars = chunk.count(bar_token_id)
+                        
+                        # If no bar tokens found or count is suspicious, estimate using file average
+                        if chunk_bars == 0:
+                            chunk_bars = max(1, int(len(chunk) / avg_tokens_per_bar))
+
                         self.examples.append({
                             'input_ids': torch.tensor(chunk, dtype=torch.long),
                             'style_id': style_id,
-                            'num_bars': total_bars, # TODO: We technically should re-calc bars for the chunk
+                            'num_bars': chunk_bars,
                             'id': f"{example_id}_chunk_{i//chunk_size}"
                         })
 

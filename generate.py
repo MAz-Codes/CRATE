@@ -174,8 +174,58 @@ def generate(args):
 
     print("Generating music...")
 
-    # Sample latent vector (use latent_dim from checkpoint config, not CLI args)
-    z = torch.randn(1, latent_dim).to(device)
+    # Determine Latent Vector z
+    if args.input_midi and os.path.exists(args.input_midi):
+        print(f"Loading input MIDI for reconstruction: {args.input_midi}")
+        try:
+            score = Score.from_midi(args.input_midi)
+            tokens = tokenizer.encode(score)
+            
+            # Extract IDs
+            token_ids = []
+            if isinstance(tokens, list) and len(tokens) > 0:
+                if hasattr(tokens[0], 'ids'):
+                    token_ids = tokens[0].ids
+                elif isinstance(tokens[0], int):
+                    token_ids = tokens
+            elif hasattr(tokens, 'ids'):
+                token_ids = tokens.ids
+                
+            if len(token_ids) > 0:
+                # Truncate to max_seq_len
+                token_ids = token_ids[:max_seq_len]
+                src = torch.tensor(token_ids, dtype=torch.long).unsqueeze(1).to(device) # [seq_len, 1]
+                
+                with torch.no_grad():
+                    # Encode
+                    # We don't provide style_id for encoding in this simple VAE setup usually, 
+                    # or we provide the style of the input if known. 
+                    # For now, let's assume unconditioned encoding or use UNKNOWN.
+                    # The model.encode method signature: encode(self, src, style_id=None, ...)
+                    # If the model expects style during encoding (it might if it concatenates style to input),
+                    # we should check model.py. 
+                    # Checking model.py from context: encode takes style_id but might not use it if not implemented.
+                    # Let's pass UNKNOWN_STYLE_IDX just in case.
+                    dummy_style = torch.tensor([UNKNOWN_STYLE_IDX], dtype=torch.long, device=device)
+                    mu, logvar = model.encode(src, style_id=dummy_style)
+                    
+                    if args.reconstruct:
+                        # Use mean for best reconstruction
+                        z = mu
+                        print("Encoded input MIDI to latent space (using mean).")
+                    else:
+                        # Sample with noise (variation)
+                        z = model.reparameterize(mu, logvar)
+                        print("Encoded input MIDI and sampled nearby (variation).")
+            else:
+                print("Error: No tokens found in input MIDI. Falling back to random sampling.")
+                z = torch.randn(1, latent_dim).to(device)
+        except Exception as e:
+            print(f"Error processing input MIDI: {e}. Falling back to random sampling.")
+            z = torch.randn(1, latent_dim).to(device)
+    else:
+        # Random sampling
+        z = torch.randn(1, latent_dim).to(device)
 
     # Prepare Style
     if args.style:
@@ -413,6 +463,10 @@ if __name__ == "__main__":
                         help="Merge all tracks into a single piano track (default: False, keep original tracks)")
     parser.add_argument("--tempo", type=int, default=None,
                         help="Target tempo in BPM")
+    parser.add_argument("--input_midi", type=str, default=None,
+                        help="Path to input MIDI for reconstruction")
+    parser.add_argument("--reconstruct", action="store_true",
+                        help="Reconstruct the input MIDI instead of random sampling")
 
     args = parser.parse_args()
 

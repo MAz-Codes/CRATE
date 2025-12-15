@@ -3,13 +3,101 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataset import GrooveMidiDataset, DataCollator, STYLES
+from dataset import GrooveMidiDataset, DataCollator, STYLES, UNKNOWN_STYLE_IDX
 from model import MusicTransformerVAE, generate_square_subsequent_mask
 import argparse
 import os
 from tqdm import tqdm
 import json
 import time
+from symusic import Score
+
+
+def generate_samples(model, tokenizer, device, epoch, output_dir, num_samples=2):
+    """
+    Generate sample MIDI files during training to monitor progress.
+    """
+    model.eval()
+    samples_dir = os.path.join(output_dir, 'samples')
+    os.makedirs(samples_dir, exist_ok=True)
+    
+    test_cases = [
+        {'style': 'funk', 'bars': 4, 'name': 'funk_4bars'},
+        {'style': 'rock', 'bars': 8, 'name': 'rock_8bars'}
+    ]
+    
+    print(f"\nGenerating {len(test_cases)} validation samples...")
+    
+    with torch.no_grad():
+        for i, case in enumerate(test_cases):
+            # Prepare Style
+            style_name = case['style']
+            if style_name in STYLES:
+                style_id = STYLES.index(style_name)
+            else:
+                style_id = UNKNOWN_STYLE_IDX
+            
+            style_tensor = torch.tensor([style_id], dtype=torch.long, device=device)
+            
+            # Prepare Bar Count
+            bar_count = case['bars']
+            bar_tensor = torch.tensor([bar_count], dtype=torch.long, device=device)
+            
+            # Sample Latent Vector
+            z = torch.randn(1, model.latent_dim).to(device)
+            
+            # Predict Length (optional check)
+            bar_emb = model.bar_embedding(bar_tensor)
+            length_input = torch.cat([z, bar_emb], dim=1)
+            predicted_length_normalized = model.length_predictor(length_input).item()
+            target_seq_len = int(predicted_length_normalized * model.max_seq_len)
+            # Clamp target length to reasonable bounds (e.g. 32 tokens per bar approx)
+            target_seq_len = max(32, min(model.max_seq_len, target_seq_len))
+            
+            # Start Token
+            try:
+                bos_token = tokenizer["BOS_None"]
+                if isinstance(bos_token, list):
+                    start_token = bos_token[0]
+                else:
+                    start_token = int(bos_token)
+            except:
+                start_token = 1 # Fallback
+                
+            generated = torch.tensor([[start_token]], dtype=torch.long).to(device)
+            
+            # Decode Loop
+            for _ in range(target_seq_len):
+                seq_len = generated.size(0)
+                tgt_mask = generate_square_subsequent_mask(seq_len).to(device)
+                
+                logits = model.decode(z, generated, style_id=style_tensor, bar_id=bar_tensor, tgt_mask=tgt_mask)
+                last_logits = logits[-1, :]
+                
+                # Greedy sampling for stability during training checks
+                next_token = torch.argmax(last_logits, dim=-1).unsqueeze(0).unsqueeze(1)
+                generated = torch.cat([generated, next_token], dim=0)
+                
+                # Stop if EOS
+                try:
+                    eos_token = tokenizer["EOS_None"]
+                    eos_id = eos_token[0] if isinstance(eos_token, list) else int(eos_token)
+                    if next_token.item() == eos_id:
+                        break
+                except:
+                    pass
+            
+            # Save MIDI
+            gen_seq = generated.squeeze().cpu().numpy().tolist()
+            try:
+                # Decode tokens to Score
+                score = tokenizer.decode(gen_seq)
+                filename = f"epoch_{epoch+1}_{case['name']}.mid"
+                score.dump_midi(os.path.join(samples_dir, filename))
+            except Exception as e:
+                print(f"Failed to save sample {case['name']}: {e}")
+
+    model.train()
 
 
 def validate(model, dataloader, criterion, device, vocab_size):
@@ -177,7 +265,9 @@ def train(args):
             history = json.load(f)
         print(f"Loaded {len(history['train_loss'])} previous epochs of history")
     else:
-        history = {'train_loss': [], 'val_loss': [], 'val_perplexity': []}
+        history = {'train_loss': [], 'val_loss': [], 'val_perplexity': [], 
+                   'train_recon_loss': [], 'train_kl_loss': [], 'train_length_loss': [],
+                   'val_recon_loss': [], 'val_kl_loss': [], 'beta': [], 'active_units': []}
 
 
     print(f"\nStarting training for {args.epochs} epochs...")
@@ -188,9 +278,15 @@ def train(args):
 
         model.train()
 
-        # KL warmup: if kl_warmup_epochs is 0, use full training duration (original behavior)
-        kl_warmup_epochs = args.kl_warmup_epochs if args.kl_warmup_epochs > 0 else args.epochs
-        beta = min(1.0, (epoch + 1) / kl_warmup_epochs)
+        # Cyclic Annealing Schedule
+        # Cycle every 10 epochs (or args.kl_warmup_epochs if provided)
+        cycle_length = args.kl_warmup_epochs if args.kl_warmup_epochs > 0 else 10
+        cycle = epoch // cycle_length
+        epoch_in_cycle = epoch % cycle_length
+        
+        # Linear warmup for first 50% of cycle, then stay at 1.0
+        # beta goes from 0 to 1 over cycle_length/2 epochs
+        beta = min(1.0, epoch_in_cycle / (cycle_length * 0.5))
         
         # Linear warmup for learning rate in first few epochs (only if lr_warmup_epochs > 0)
         if args.lr_warmup_epochs > 0 and epoch < args.lr_warmup_epochs:
@@ -214,10 +310,38 @@ def train(args):
 
             tgt = src
 
-            optimizer.zero_grad()
-
-
-            dec_input = tgt[:-1]
+            # Word Dropout: Randomly mask tokens in decoder input
+            # This forces the decoder to rely on the latent variable z
+            if args.word_dropout > 0:
+                # Create a mask for word dropout (1 = keep, 0 = mask)
+                # We don't mask padding tokens or the first token (BOS)
+                prob = torch.rand(tgt.shape, device=device)
+                # Mask tokens where prob < word_dropout
+                # But keep padding (src_key_padding_mask is True for padding in some conventions, check dataset)
+                # In PyTorch Transformer, key_padding_mask is True for padded elements.
+                # Here src_key_padding_mask is likely True for padding.
+                
+                # Let's assume we mask with a special token or just 0 (if 0 is PAD, maybe use MASK token if available)
+                # If no MASK token, we can replace with PAD or random token.
+                # Ideally we should use a MASK token.
+                
+                # Check if MASK token exists in tokenizer
+                try:
+                    mask_token_id = train_dataset.tokenizer["MASK_None"]
+                    if isinstance(mask_token_id, list): mask_token_id = mask_token_id[0]
+                except:
+                    mask_token_id = pad_token_id # Fallback to PAD if no MASK
+                
+                word_dropout_mask = (prob < args.word_dropout) & (tgt != pad_token_id)
+                # Don't mask the first token (BOS usually)
+                word_dropout_mask[0, :] = False 
+                
+                dec_input_raw = tgt[:-1].clone()
+                dec_input_raw[word_dropout_mask[:-1]] = mask_token_id
+                dec_input = dec_input_raw
+            else:
+                dec_input = tgt[:-1]
+            
             dec_target = tgt[1:]
             dec_padding_mask = src_key_padding_mask[:, :-1]
 
@@ -241,6 +365,11 @@ def train(args):
             free_bits = torch.tensor(args.free_bits, device=device)
             kl_loss = torch.mean(torch.sum(torch.max(kl_element, free_bits), dim=1))
             
+            # Calculate active units (KL > 0.1)
+            # We use the mean KL per dimension across the batch
+            mean_kl_per_dim = torch.mean(kl_element, dim=0) # [latent_dim]
+            active_units = torch.sum(mean_kl_per_dim > 0.1).item()
+            
             # Calculate actual sequence lengths (non-padding tokens)
             actual_lengths = (src != 0).sum(dim=0).float()  # [batch_size]
             
@@ -256,20 +385,25 @@ def train(args):
 
             # Total loss with length prediction
             loss = recon_loss + beta * kl_loss * args.kl_weight + args.length_loss_weight * length_loss
+            
+            # Scale loss by gradient accumulation steps
+            loss = loss / args.grad_accum_steps
 
             loss.backward()
 
+            if (batch_idx + 1) % args.grad_accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-            optimizer.step()
-
-            total_loss += loss.item()
+            # Multiply loss back for logging
+            loss_val = loss.item() * args.grad_accum_steps
+            total_loss += loss_val
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
 
             progress_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
+                'Loss': f'{loss_val:.4f}',
                 'Recon': f'{recon_loss.item():.4f}',
                 'KL': f'{kl_loss.item():.4f}',
                 'Length': f'{length_loss.item():.4f}',
@@ -292,6 +426,16 @@ def train(args):
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(val_total_loss)
         history['val_perplexity'].append(val_perplexity)
+        
+        # Log detailed metrics
+        history['train_recon_loss'].append(total_recon_loss / len(train_loader))
+        history['train_kl_loss'].append(total_kl_loss / len(train_loader))
+        history['val_recon_loss'].append(val_recon_loss)
+        history['val_kl_loss'].append(val_kl_loss)
+        history['beta'].append(beta)
+        
+        # Log active units (from last batch of epoch - approximation)
+        history['active_units'].append(active_units)
 
         # Step scheduler (ReduceLROnPlateau steps on validation loss)
         scheduler.step(val_total_loss)
@@ -325,6 +469,12 @@ def train(args):
                 'args': vars(args)
             }, checkpoint_path)
             print(f"  Saved checkpoint to {checkpoint_path}")
+            
+            # Generate samples for validation
+            try:
+                generate_samples(model, train_dataset.tokenizer, device, epoch, args.output_dir)
+            except Exception as e:
+                print(f"Warning: Sample generation failed: {e}")
 
 
         history_path = os.path.join(args.output_dir, 'training_history.json')
@@ -387,6 +537,10 @@ if __name__ == "__main__":
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--length_loss_weight", type=float, default=0.1,
                         help="Weight for length prediction loss")
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                        help="Number of gradient accumulation steps")
+    parser.add_argument("--word_dropout", type=float, default=0.0,
+                        help="Probability of masking input tokens to decoder")
 
     args = parser.parse_args()
     train(args)
