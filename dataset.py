@@ -31,13 +31,13 @@ class GrooveMidiDataset(Dataset):
         bar_counts_path = os.path.join(os.path.dirname(__file__), bar_counts_file)
         
         self.bar_counts = {}
-        if os.path.exists(bar_counts_path):
-            try:
-                with open(bar_counts_path, 'r') as f:
-                    self.bar_counts = json.load(f)
-                print(f"Loaded bar counts from {bar_counts_file}")
-            except Exception as e:
-                print(f"Note: Could not load bar counts ({e}). Using default value of 8 bars.")
+        # if os.path.exists(bar_counts_path):
+        #     try:
+        #         with open(bar_counts_path, 'r') as f:
+        #             self.bar_counts = json.load(f)
+        #         print(f"Loaded bar counts from {bar_counts_file}")
+        #     except Exception as e:
+        #         print(f"Note: Could not load bar counts ({e}). Using default value of 8 bars.")
 
         # Initialize Tokenizer (miditok 3.x)
         # Optimized for Drums: No chords, no programs (single instrument implied)

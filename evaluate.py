@@ -219,6 +219,8 @@ if __name__ == "__main__":
                         default="Final_GigaMIDI_V1.1_Final", help="Path to MIDI dataset")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--tokenizer_path", type=str, default="checkpoints/tokenizer.json",
+                        help="Path to tokenizer config")
 
     args = parser.parse_args()
     evaluate(args)

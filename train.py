@@ -11,6 +11,52 @@ from tqdm import tqdm
 import json
 import time
 from symusic import Score
+import matplotlib.pyplot as plt
+
+
+def plot_training_history(history, output_dir):
+    try:
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+
+        # Loss
+        axs[0, 0].plot(history['train_loss'], label='Train Loss')
+        axs[0, 0].plot(history['val_loss'], label='Val Loss')
+        axs[0, 0].set_title('Total Loss')
+        axs[0, 0].legend()
+        axs[0, 0].grid(True)
+
+        # Reconstruction vs KL
+        axs[0, 1].plot(history['train_recon_loss'], label='Train Recon')
+        axs[0, 1].plot(history['val_recon_loss'], label='Val Recon')
+        axs[0, 1].set_title('Reconstruction Loss')
+        axs[0, 1].legend()
+        axs[0, 1].grid(True)
+
+        # KL Divergence
+        axs[1, 0].plot(history['train_kl_loss'], label='Train KL')
+        axs[1, 0].plot(history['val_kl_loss'], label='Val KL')
+        axs[1, 0].set_title('KL Divergence')
+        axs[1, 0].legend()
+        axs[1, 0].grid(True)
+
+        # Active Units & Beta
+        ax2 = axs[1, 1].twinx()
+        axs[1, 1].plot(history['active_units'], label='Active Units', color='purple')
+        ax2.plot(history['beta'], label='Beta', color='orange', linestyle='--')
+        axs[1, 1].set_title('Active Units & Beta')
+        axs[1, 1].set_ylabel('Active Units')
+        ax2.set_ylabel('Beta')
+        axs[1, 1].legend(loc='upper left')
+        ax2.legend(loc='upper right')
+        axs[1, 1].grid(True)
+
+        plt.tight_layout()
+        plot_path = os.path.join(output_dir, 'training_plot.png')
+        plt.savefig(plot_path)
+        plt.close()
+        # print(f"✓ Saved training plot to {plot_path}")
+    except Exception as e:
+        print(f"Warning: Could not plot training history: {e}")
 
 
 def generate_samples(model, tokenizer, device, epoch, output_dir, num_samples=2):
@@ -256,14 +302,25 @@ def train(args):
 
 
     os.makedirs(args.output_dir, exist_ok=True)
+    logs_dir = os.path.join(args.output_dir, 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
 
     # Initialize or load training history
-    history_path = os.path.join(args.output_dir, 'training_history.json')
-    if args.resume and os.path.exists(history_path):
-        print(f"Loading training history from {history_path}")
-        with open(history_path, 'r') as f:
-            history = json.load(f)
-        print(f"Loaded {len(history['train_loss'])} previous epochs of history")
+    history_path = os.path.join(logs_dir, 'training_history.json')
+    # Check legacy path first if resume is requested but new path doesn't exist
+    legacy_history_path = os.path.join(args.output_dir, 'training_history.json')
+    
+    if args.resume:
+        if os.path.exists(history_path):
+            print(f"Loading training history from {history_path}")
+            with open(history_path, 'r') as f:
+                history = json.load(f)
+            print(f"Loaded {len(history['train_loss'])} previous epochs of history")
+        elif os.path.exists(legacy_history_path):
+            print(f"Loading training history from legacy path {legacy_history_path}")
+            with open(legacy_history_path, 'r') as f:
+                history = json.load(f)
+            print(f"Loaded {len(history['train_loss'])} previous epochs of history")
     else:
         history = {'train_loss': [], 'val_loss': [], 'val_perplexity': [], 
                    'train_recon_loss': [], 'train_kl_loss': [], 'train_length_loss': [],
@@ -477,9 +534,12 @@ def train(args):
                 print(f"Warning: Sample generation failed: {e}")
 
 
-        history_path = os.path.join(args.output_dir, 'training_history.json')
+        history_path = os.path.join(logs_dir, 'training_history.json')
         with open(history_path, 'w') as f:
             json.dump(history, f, indent=2)
+        
+        # Plot history
+        plot_training_history(history, logs_dir)
 
 
     final_path = os.path.join(args.output_dir, 'final_model.pt')

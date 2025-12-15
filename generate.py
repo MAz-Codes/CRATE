@@ -447,8 +447,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     # Changed default to save in a folder
-    parser.add_argument("--output_path", type=str, default="generated_samples/generated.mid")
-    parser.add_argument("--tokenizer_path", type=str, default="tokenizer.json")
+    parser.add_argument("--output_path", type=str, default="samples/generated.mid")
+    parser.add_argument("--tokenizer_path", type=str, default="checkpoints/tokenizer.json")
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=4)
