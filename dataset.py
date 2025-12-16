@@ -25,10 +25,11 @@ STYLE_TO_IDX = {style: i for i, style in enumerate(STYLES)}
 UNKNOWN_STYLE_IDX = len(STYLES)
 
 class GrooveMidiDataset(Dataset):
-    def __init__(self, split='train', max_seq_len=1024, max_examples=None, use_bar_filter=False, augment=False):
+    def __init__(self, split='train', max_seq_len=1024, max_examples=None, use_bar_filter=False, augment=False, chunk_bars=8):
         self.max_seq_len = max_seq_len
         self.split = split
         self.augment = augment
+        self.chunk_bars = chunk_bars
         
         # Load bar counts (optional)
         bar_counts_file = 'bar_counts_filtered.json' if use_bar_filter else 'bar_counts.json'
@@ -105,8 +106,7 @@ class GrooveMidiDataset(Dataset):
                     ts = score.time_signatures[0]
                     ticks_per_bar = int(tpq * 4 * ts.numerator / ts.denominator)
                 
-                chunk_bars = 8
-                chunk_ticks = ticks_per_bar * chunk_bars
+                chunk_ticks = ticks_per_bar * self.chunk_bars
                 
                 # Create chunks
                 for i in range(0, end_tick, chunk_ticks):
@@ -122,7 +122,7 @@ class GrooveMidiDataset(Dataset):
                         'start_tick': start,
                         'end_tick': end,
                         'style_id': style_id,
-                        'num_bars': chunk_bars,
+                        'num_bars': self.chunk_bars,
                         'id': f"{example_id}_chunk_{i//chunk_ticks}"
                     })
 
