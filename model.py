@@ -25,19 +25,21 @@ class PositionalEncoding(nn.Module):
 
 class MusicTransformerVAE(nn.Module):
     def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=6,
-                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1, latent_dim=256, max_seq_len=1024, num_styles=12, num_bar_classes=33, num_memory_tokens=4):
+                 num_decoder_layers=6, num_conductor_layers=4, dim_feedforward=2048, 
+                 dropout=0.1, latent_dim=256, max_seq_len=1024, num_styles=12, 
+                 max_bars=16):
         super(MusicTransformerVAE, self).__init__()
 
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.latent_dim = latent_dim
         self.max_seq_len = max_seq_len
-        self.num_memory_tokens = num_memory_tokens
+        self.max_bars = max_bars
 
         # Embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.style_embedding = nn.Embedding(num_styles, d_model)
-        self.bar_embedding = nn.Embedding(num_bar_classes, d_model)  # Bar count conditioning
+        self.bar_embedding = nn.Embedding(33, d_model)  # Bar count conditioning (keep 33 for compatibility)
         self.pos_encoder = PositionalEncoding(
             d_model, dropout, max_len=max_seq_len)
 
@@ -54,8 +56,15 @@ class MusicTransformerVAE(nn.Module):
         self.fc_mu = nn.Linear(d_model, latent_dim)
         self.fc_var = nn.Linear(d_model, latent_dim)
 
-        # Project latent back to d_model for decoder memory (multiple tokens for stronger bottleneck)
-        self.fc_z_to_memory = nn.Linear(latent_dim, d_model * num_memory_tokens)
+        # --- HIERARCHICAL CONDUCTOR ---
+        # Transforms Z into Bar Embeddings
+        self.fc_z_to_conductor = nn.Linear(latent_dim, d_model)
+        
+        # Learned queries for each bar position [max_bars, 1, d_model]
+        self.bar_queries = nn.Parameter(torch.randn(max_bars, 1, d_model))
+        
+        conductor_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+        self.conductor = nn.TransformerEncoder(conductor_layers, num_conductor_layers)
 
         # Decoder
         decoder_layers = nn.TransformerDecoderLayer(
@@ -66,16 +75,15 @@ class MusicTransformerVAE(nn.Module):
         # Output projection
         self.output_layer = nn.Linear(d_model, vocab_size)
         
-        # Length prediction head (predicts sequence length from latent + bar embedding)
-        # Output is normalized to [0, 1] range (fraction of max_seq_len)
+        # Length prediction head
         self.length_predictor = nn.Sequential(
             nn.Linear(latent_dim + d_model, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),  # Predict single value: sequence length
-            nn.Sigmoid()  # Normalize to [0, 1] range
+            nn.Linear(128, 1),
+            nn.Sigmoid()
         )
 
     def reparameterize(self, mu, logvar):
@@ -92,11 +100,6 @@ class MusicTransformerVAE(nn.Module):
         src_emb = self.embedding(src) * math.sqrt(self.d_model)
         src_emb = self.pos_encoder(src_emb)
 
-        # Concatenate CLS + Embeddings
-        # Note: We need to adjust masks if we use them, but for simplicity in VAE,
-        # we often just let it attend to everything.
-        # If src_key_padding_mask is provided, we need to pad it for CLS token (False = not masked)
-        # Clone mask to avoid in-place modification side effects
         if src_key_padding_mask is not None:
             cls_mask = torch.zeros(
                 (batch_size, 1), dtype=torch.bool, device=src.device)
@@ -114,7 +117,7 @@ class MusicTransformerVAE(nn.Module):
         output = self.transformer_encoder(
             encoder_input, src_key_padding_mask=src_key_padding_mask)
 
-        # Take the state of the [CLS] token (first token)
+        # Take the state of the [CLS] token
         cls_output = output[0]  # [batch_size, d_model]
 
         mu = self.fc_mu(cls_output)
@@ -124,46 +127,69 @@ class MusicTransformerVAE(nn.Module):
 
     def decode(self, z, tgt, style_id=None, bar_id=None, tgt_key_padding_mask=None, tgt_mask=None, use_latent_dropout=False):
         """
-        Decode from latent z to output sequence.
-        Args:
-            z: latent vector [batch_size, latent_dim]
-            tgt: target tokens [seq_len, batch_size]
-            style_id: style conditioning [batch_size]
-            bar_id: bar count conditioning [batch_size]
-            tgt_key_padding_mask: padding mask for target
-            tgt_mask: causal mask for target
-            use_latent_dropout: if True, randomly zero out z during training (10% chance)
+        Decode from latent z to output sequence using Hierarchical Conductor.
         """
-        # Latent dropout: force decoder to be robust to missing latent information
+        # Latent dropout
         if use_latent_dropout and self.training:
             dropout_mask = torch.bernoulli(torch.full((z.size(0), 1), 0.9, device=z.device))
             z = z * dropout_mask
         
-        # Project z to multiple memory tokens for stronger latent bottleneck
         batch_size = z.size(0)
-        memory = self.fc_z_to_memory(z).view(batch_size, self.num_memory_tokens, self.d_model)
-        memory = memory.transpose(0, 1)  # [num_memory_tokens, batch_size, d_model]
+        
+        # --- CONDUCTOR PASS ---
+        # Project Z to d_model
+        z_emb = self.fc_z_to_conductor(z).unsqueeze(0) # [1, batch, d_model]
+        
+        # Expand queries
+        queries = self.bar_queries.expand(-1, batch_size, -1) # [max_bars, batch, d_model]
+        
+        # Add Z to queries (Conditioning)
+        conductor_input = queries + z_emb
+        
+        # Add Style to Conductor
+        if style_id is not None:
+            style_emb = self.style_embedding(style_id).unsqueeze(0)
+            conductor_input = conductor_input + style_emb
+            
+        # Run Conductor
+        # Output: [max_bars, batch, d_model]
+        bar_embeddings = self.conductor(conductor_input)
+        
+        # Create Mask for Conductor Output (if bar_id/num_bars provided)
+        memory_key_padding_mask = None
+        if bar_id is not None:
+            # bar_id is num_bars [batch]
+            # mask: [batch, max_bars] (True = masked)
+            # We mask bars > num_bars
+            # bar_id is 1-based count.
+            # indices are 0 to max_bars-1
+            # if num_bars=4, indices 0,1,2,3 are valid. 4+ masked.
+            mask = torch.arange(self.max_bars, device=z.device).expand(batch_size, -1) >= bar_id.unsqueeze(1)
+            memory_key_padding_mask = mask
 
+        # --- DECODER PASS ---
         # Embed target tokens
         tgt_emb = self.embedding(tgt) * math.sqrt(self.d_model)
         
-        # Add style embedding if provided
+        # Add style embedding to decoder too (optional, but helps)
         if style_id is not None:
-            style_emb = self.style_embedding(style_id)  # [batch_size, d_model]
-            tgt_emb = tgt_emb + style_emb.unsqueeze(0)  # Broadcast to [seq_len, batch_size, d_model]
+            style_emb = self.style_embedding(style_id)
+            tgt_emb = tgt_emb + style_emb.unsqueeze(0)
         
-        # Add bar embedding if provided
+        # Add bar count embedding (global context)
         if bar_id is not None:
-            bar_emb = self.bar_embedding(bar_id)  # [batch_size, d_model]
-            tgt_emb = tgt_emb + bar_emb.unsqueeze(0)  # Broadcast to [seq_len, batch_size, d_model]
+            bar_count_emb = self.bar_embedding(bar_id)
+            tgt_emb = tgt_emb + bar_count_emb.unsqueeze(0)
         
         tgt_emb = self.pos_encoder(tgt_emb)
 
         # Decode
+        # Memory is bar_embeddings
         output = self.transformer_decoder(
-            tgt_emb, memory,
+            tgt_emb, bar_embeddings,
             tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask
         )
 
         # Project to vocabulary
@@ -171,14 +197,6 @@ class MusicTransformerVAE(nn.Module):
         return logits
 
     def forward(self, src, tgt, style_id=None, bar_id=None, src_key_padding_mask=None, tgt_key_padding_mask=None, tgt_mask=None):
-        """
-        Forward pass through the VAE.
-        Args:
-            src: source tokens [seq_len, batch_size]
-            tgt: target tokens [seq_len, batch_size]
-            style_id: style conditioning [batch_size]
-            bar_id: bar count conditioning [batch_size]
-        """
         # Encode
         mu, logvar = self.encode(
             src, src_key_padding_mask=src_key_padding_mask)
@@ -186,20 +204,20 @@ class MusicTransformerVAE(nn.Module):
         # Reparameterize
         z = self.reparameterize(mu, logvar)
         
-        # Predict length from latent and bar embedding
+        # Predict length
         if bar_id is not None:
-            bar_emb = self.bar_embedding(bar_id)  # [batch_size, d_model]
-            length_input = torch.cat([z, bar_emb], dim=1)  # [batch_size, latent_dim + d_model]
-            predicted_length = self.length_predictor(length_input).squeeze(-1)  # [batch_size]
+            bar_emb = self.bar_embedding(bar_id)
+            length_input = torch.cat([z, bar_emb], dim=1)
+            predicted_length = self.length_predictor(length_input).squeeze(-1)
         else:
             predicted_length = None
 
-        # Decode (with latent dropout during training)
+        # Decode
         logits = self.decode(
             z, tgt, style_id=style_id, bar_id=bar_id,
             tgt_key_padding_mask=tgt_key_padding_mask,
             tgt_mask=tgt_mask,
-            use_latent_dropout=True  # Enable latent dropout during training
+            use_latent_dropout=True
         )
 
         return logits, mu, logvar, predicted_length

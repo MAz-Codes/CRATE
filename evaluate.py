@@ -24,11 +24,7 @@ def evaluate(args):
 
     # Get PAD token ID - use 0 as default for miditok 3.x
     try:
-        pad_token = test_dataset.tokenizer["PAD"]
-        if isinstance(pad_token, list):
-            pad_token_id = pad_token[0]
-        else:
-            pad_token_id = int(pad_token)
+        pad_token_id = test_dataset.tokenizer["PAD_None"]
     except:
         pad_token_id = 0
         print("Note: Using token ID 0 as PAD (miditok 3.x default)")
@@ -69,9 +65,11 @@ def evaluate(args):
         nhead=model_args['nhead'],
         num_encoder_layers=model_args['num_layers'],
         num_decoder_layers=model_args['num_layers'],
+        num_conductor_layers=model_args.get('num_conductor_layers', 4),
         latent_dim=model_args['latent_dim'],
         max_seq_len=model_args.get('seq_len', args.seq_len),
-        num_styles=num_styles
+        num_styles=num_styles,
+        max_bars=model_args.get('max_bars', 32)
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -96,13 +94,14 @@ def evaluate(args):
     print("\nEvaluating on test set...")
 
     with torch.no_grad():
-        for src, src_key_padding_mask, style_batch in tqdm(test_loader, desc="Evaluating"):
+        for src, src_key_padding_mask, style_batch, bar_batch in tqdm(test_loader, desc="Evaluating"):
             if src is None:
                 continue
 
             src = src.to(device)
             src_key_padding_mask = src_key_padding_mask.to(device)
             style_batch = style_batch.to(device)
+            bar_batch = bar_batch.to(device)
 
             tgt = src
             dec_input = tgt[:-1]
@@ -113,7 +112,7 @@ def evaluate(args):
             tgt_seq_len = dec_input.shape[0]
             tgt_mask = generate_square_subsequent_mask(tgt_seq_len).to(device)
 
-            logits, mu, logvar = model(src, dec_input, style_id=style_batch,
+            logits, mu, logvar, predicted_length = model(src, dec_input, style_id=style_batch, bar_id=bar_batch,
                                        src_key_padding_mask=src_key_padding_mask,
                                        tgt_key_padding_mask=dec_padding_mask,
                                        tgt_mask=tgt_mask)

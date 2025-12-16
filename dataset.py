@@ -2,18 +2,22 @@ import os
 import torch
 from torch.utils.data import Dataset
 from miditok import REMI, TokenizerConfig
-from symusic import Score
+from symusic import Score, Note
 from tqdm import tqdm
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import tensorflow_datasets as tfds
 import tensorflow as tf
+# Prevent TensorFlow from grabbing all GPU memory
+tf.config.set_visible_devices([], 'GPU')
+
 import tempfile
 import json
+import random
+import copy
 
 # Define supported styles for mapping
-# Define supported styles from Groove MIDI Dataset
 STYLES = ['afrobeat', 'afrocuban', 'blues', 'country', 'dance', 'funk', 'gospel', 
           'highlife', 'hiphop', 'jazz', 'latin', 'middleeastern', 'neworleans', 
           'pop', 'punk', 'reggae', 'rock', 'soul']
@@ -21,33 +25,36 @@ STYLE_TO_IDX = {style: i for i, style in enumerate(STYLES)}
 UNKNOWN_STYLE_IDX = len(STYLES)
 
 class GrooveMidiDataset(Dataset):
-    def __init__(self, split='train', max_seq_len=1024, max_examples=None, use_bar_filter=False):
+    def __init__(self, split='train', max_seq_len=1024, max_examples=None, use_bar_filter=False, augment=False):
         self.max_seq_len = max_seq_len
         self.split = split
+        self.augment = augment
         
         # Load bar counts (optional)
-        # Bar counts are not critical for model functionality
         bar_counts_file = 'bar_counts_filtered.json' if use_bar_filter else 'bar_counts.json'
         bar_counts_path = os.path.join(os.path.dirname(__file__), bar_counts_file)
         
         self.bar_counts = {}
-        # if os.path.exists(bar_counts_path):
-        #     try:
-        #         with open(bar_counts_path, 'r') as f:
-        #             self.bar_counts = json.load(f)
-        #         print(f"Loaded bar counts from {bar_counts_file}")
-        #     except Exception as e:
-        #         print(f"Note: Could not load bar counts ({e}). Using default value of 8 bars.")
+        if os.path.exists(bar_counts_path):
+            try:
+                with open(bar_counts_path, 'r') as f:
+                    self.bar_counts = json.load(f)
+                print(f"Loaded bar counts from {bar_counts_file}")
+            except Exception as e:
+                print(f"Note: Could not load bar counts ({e}). Using default value of 8 bars.")
 
-        # Initialize Tokenizer (miditok 3.x)
-        # Optimized for Drums: No chords, no programs (single instrument implied)
+        # Initialize Tokenizer (REMI - Revamped MIDI)
+        # Switched back to REMI for Hierarchical Model: Explicit 'Bar' tokens are crucial 
+        # for the Decoder to align with the Conductor's bar-level embeddings.
         config = TokenizerConfig(
             num_velocities=16,
             use_chords=False,
-            use_programs=False, # Drums don't need program changes for this VAE
+            use_programs=False,
             use_rests=True,
             use_tempos=True,
-            use_time_signatures=True
+            use_time_signatures=True,
+            use_sustain_pedals=False,
+            use_pitch_bends=False
         )
         self.tokenizer = REMI(config)
         
@@ -66,16 +73,9 @@ class GrooveMidiDataset(Dataset):
         self.style_primary_feature = info.features['style']['primary']
         self.examples = []
         
-        # Pre-process loop to tokenize and chunk
-        print(f"Processing and chunking {split} data...")
+        print(f"Indexing {split} data...")
         
-        # Get Bar token ID for counting bars in chunks
-        try:
-            bar_token_id = self.tokenizer["Bar_None"]
-        except:
-            bar_token_id = -1 # Fallback
-
-        for example in tqdm(ds, desc=f"Loading GMD {split}"):
+        for example in tqdm(ds, desc=f"Indexing GMD {split}"):
             try:
                 example_id = example['id'].numpy().decode('utf-8')
                 
@@ -87,147 +87,146 @@ class GrooveMidiDataset(Dataset):
                 style_name = self.style_primary_feature.int2str(style_int)
                 style_id = STYLE_TO_IDX.get(style_name.lower(), UNKNOWN_STYLE_IDX)
                 
-                # Get Metadata
-                bpm = int(example['bpm'].numpy())
-                # Default to 8 bars if not in bar_counts (safe fallback)
-                total_bars = self.bar_counts.get(example_id, 8)
-
-                # Load MIDI directly from bytes
+                # Load MIDI bytes
                 midi_bytes = example['midi'].numpy()
+                
+                # Parse Score to determine chunks
                 score = Score.from_midi(midi_bytes)
-
-                # Tokenize
-                tokens = self.tokenizer.encode(score)
                 
-                # Extract IDs
-                token_ids = []
-                if isinstance(tokens, list) and len(tokens) > 0:
-                    if hasattr(tokens[0], 'ids'):
-                        token_ids = tokens[0].ids
-                    elif isinstance(tokens[0], int):
-                        token_ids = tokens
-                elif hasattr(tokens, 'ids'):
-                    token_ids = tokens.ids
-                
-                if len(token_ids) == 0:
+                # Calculate bars
+                end_tick = score.end()
+                if end_tick == 0:
                     continue
-
-                # CHUNKING STRATEGY
-                # Split long sequences into chunks of max_seq_len with some overlap or just simple tiling
-                # For VAEs, discrete chunks are usually fine.
+                    
+                tpq = score.ticks_per_quarter
+                ticks_per_bar = tpq * 4 
                 
-                chunk_size = self.max_seq_len
+                if len(score.time_signatures) > 0:
+                    ts = score.time_signatures[0]
+                    ticks_per_bar = int(tpq * 4 * ts.numerator / ts.denominator)
                 
-                # Calculate average tokens per bar for this file
-                avg_tokens_per_bar = len(token_ids) / max(1, total_bars)
-
-                # If sequence is short enough, just use it
-                if len(token_ids) <= chunk_size:
-                    # Recalculate bars for short sequences too (sometimes metadata is wrong)
-                    actual_bars = total_bars
-                    if bar_token_id != -1:
-                        count = token_ids.count(bar_token_id)
-                        if count > 0:
-                            actual_bars = count
-                        else:
-                            # Estimate
-                            actual_bars = max(1, int(len(token_ids) / avg_tokens_per_bar))
-
+                chunk_bars = 8
+                chunk_ticks = ticks_per_bar * chunk_bars
+                
+                # Create chunks
+                for i in range(0, end_tick, chunk_ticks):
+                    start = i
+                    end = min(i + chunk_ticks, end_tick)
+                    
+                    # Skip short last chunks
+                    if (end - start) < ticks_per_bar:
+                        continue
+                        
                     self.examples.append({
-                        'input_ids': torch.tensor(token_ids, dtype=torch.long),
+                        'midi_bytes': midi_bytes, 
+                        'start_tick': start,
+                        'end_tick': end,
                         'style_id': style_id,
-                        'num_bars': actual_bars,
-                        'id': example_id
+                        'num_bars': chunk_bars,
+                        'id': f"{example_id}_chunk_{i//chunk_ticks}"
                     })
-                else:
-                    # Split into chunks
-                    # We create multiple examples from one file
-                    # We stride by chunk_size (no overlap) to maximize unique data
-                    for i in range(0, len(token_ids), chunk_size):
-                        chunk = token_ids[i : i + chunk_size]
-                        
-                        # Discard very short last chunks (e.g. < 50 tokens) to avoid noise
-                        if len(chunk) < 50:
-                            continue
-                        
-                        # Calculate actual bars in this chunk
-                        chunk_bars = 0
-                        if bar_token_id != -1:
-                            chunk_bars = chunk.count(bar_token_id)
-                        
-                        # If no bar tokens found or count is suspicious, estimate using file average
-                        if chunk_bars == 0:
-                            chunk_bars = max(1, int(len(chunk) / avg_tokens_per_bar))
-
-                        self.examples.append({
-                            'input_ids': torch.tensor(chunk, dtype=torch.long),
-                            'style_id': style_id,
-                            'num_bars': chunk_bars,
-                            'id': f"{example_id}_chunk_{i//chunk_size}"
-                        })
 
             except Exception as e:
-                # print(f"Error processing {example_id}: {e}")
                 continue
             
         if max_examples:
             self.examples = self.examples[:max_examples]
             
-        print(f"Processed {len(self.examples)} training sequences.")
+        print(f"Indexed {len(self.examples)} sequences.")
 
     def __len__(self):
         return len(self.examples)
 
+    def apply_augmentation(self, score):
+        # 1. Velocity Noise
+        if random.random() < 0.5:
+            factor = random.uniform(0.8, 1.2)
+            for track in score.tracks:
+                for note in track.notes:
+                    new_vel = int(note.velocity * factor)
+                    note.velocity = max(1, min(127, new_vel))
+        
+        # 2. Timing Humanization (Micro-timing)
+        if random.random() < 0.3:
+            jitter = int(score.ticks_per_quarter * 0.05)
+            for track in score.tracks:
+                for note in track.notes:
+                    shift = random.randint(-jitter, jitter)
+                    note.time = max(0, note.time + shift)
+                    
+        # 3. Mirroring (Drum Kit Swaps)
+        if random.random() < 0.3:
+            swap_map = {
+                50: 45, 45: 50, 
+                48: 43, 43: 48,
+                49: 57, 57: 49,
+            }
+            for track in score.tracks:
+                for note in track.notes:
+                    if note.pitch in swap_map:
+                        note.pitch = swap_map[note.pitch]
+
     def __getitem__(self, idx):
-        example = self.examples[idx]
+        meta = self.examples[idx]
+        
+        # Load Score
+        score = Score.from_midi(meta['midi_bytes'])
+        
+        # Clip to chunk
+        clipped_score = score.clip(meta['start_tick'], meta['end_tick'])
+        
+        # Shift to start at 0
+        shifted_score = clipped_score.shift_time(-meta['start_tick'])
+        
+        # Augment
+        if self.augment:
+            self.apply_augmentation(shifted_score)
+            
+        # Tokenize
+        tokens = self.tokenizer.encode(shifted_score)
+        
+        # Extract IDs
+        token_ids = []
+        if isinstance(tokens, list) and len(tokens) > 0:
+            if hasattr(tokens[0], 'ids'):
+                token_ids = tokens[0].ids
+            elif isinstance(tokens[0], int):
+                token_ids = tokens
+        elif hasattr(tokens, 'ids'):
+            token_ids = tokens.ids
+            
+        # Pad or Truncate
+        if len(token_ids) > self.max_seq_len:
+            token_ids = token_ids[:self.max_seq_len]
+        else:
+            # Pad
+            try:
+                pad_id = self.tokenizer["PAD_None"]
+            except:
+                pad_id = 0 # Fallback
+                
+            token_ids += [pad_id] * (self.max_seq_len - len(token_ids))
+            
         return (
-            example['input_ids'], 
-            torch.tensor(example['style_id'], dtype=torch.long), 
-            torch.tensor(example['num_bars'], dtype=torch.long)
+            torch.tensor(token_ids, dtype=torch.long), 
+            torch.tensor(meta['style_id'], dtype=torch.long), 
+            torch.tensor(meta['num_bars'], dtype=torch.long)
         )
-
-# Keep the old class for valid reference but prevent its usage errors if dependencies are missing
-class MidiDataset(Dataset):
-    # ... (rest of old code essentially commented out or kept as legacy)
-    # For now we just keep it as is, but specific functionality is replaced by GrooveMidiDataset
-     # Class-level set to track corrupt files we've already warned about
-    _warned_corrupt_files = set()
-    
-    def __init__(self, data_dir, split='train', max_seq_len=1024, file_limit=None):
-        # Allow fallback instantiation
-        self.data_dir = data_dir
-        self.files = []
-        self.tokenizer = None
-        pass
-    def __len__(self):
-        return 0
-    def __getitem__(self, idx):
-        raise NotImplementedError("MidiDataset is deprecated. Use GrooveMidiDataset.")
-
-
 
 class DataCollator:
     def __init__(self, pad_token_id):
         self.pad_token_id = pad_token_id
 
     def __call__(self, batch):
-        # Filter out empty tensors (first element of tuple is empty)
-        batch = [item for item in batch if item[0].numel() > 0]
+        batch = [item for item in batch if item[0] is not None]
         if len(batch) == 0:
             return None, None, None, None
 
-
-        # Unzip
         seqs, styles, num_bars = zip(*batch)
 
-        # Pad sequences
-        src_batch = torch.nn.utils.rnn.pad_sequence(
-            list(seqs), batch_first=False, padding_value=self.pad_token_id)
+        src_batch = torch.stack(seqs).transpose(0, 1) # [seq_len, batch_size]
+        src_key_padding_mask = (src_batch == self.pad_token_id).transpose(0, 1) # [batch_size, seq_len]
 
-        # Create masks
-        src_key_padding_mask = (src_batch == self.pad_token_id).transpose(0, 1)
-
-        # Stack styles and bar counts
         style_batch = torch.stack(styles)
         bar_batch = torch.stack(num_bars)
 

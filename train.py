@@ -121,7 +121,7 @@ def generate_samples(model, tokenizer, device, epoch, output_dir, num_samples=2)
                 last_logits = logits[-1, :]
                 
                 # Greedy sampling for stability during training checks
-                next_token = torch.argmax(last_logits, dim=-1).unsqueeze(0).unsqueeze(1)
+                next_token = torch.argmax(last_logits, dim=-1).unsqueeze(0)
                 generated = torch.cat([generated, next_token], dim=0)
                 
                 # Stop if EOS
@@ -137,7 +137,8 @@ def generate_samples(model, tokenizer, device, epoch, output_dir, num_samples=2)
             gen_seq = generated.squeeze().cpu().numpy().tolist()
             try:
                 # Decode tokens to Score
-                score = tokenizer.decode(gen_seq)
+                # miditok 3.x expects list of lists for tracks, or TokSequence
+                score = tokenizer.decode([gen_seq])
                 filename = f"epoch_{epoch+1}_{case['name']}.mid"
                 score.dump_midi(os.path.join(samples_dir, filename))
             except Exception as e:
@@ -223,14 +224,10 @@ def train(args):
     # Load training dataset
     # Bar counts are optional - model will use default of 8 bars if unavailable
     train_dataset = GrooveMidiDataset(
-        split='train', max_seq_len=args.seq_len, max_examples=args.file_limit)
+        split='train', max_seq_len=args.seq_len, max_examples=args.file_limit, augment=True)
 
     try:
-        pad_token = train_dataset.tokenizer["PAD"]
-        if isinstance(pad_token, list):
-            pad_token_id = pad_token[0]
-        else:
-            pad_token_id = int(pad_token)
+        pad_token_id = train_dataset.tokenizer["PAD_None"]
     except:
         pad_token_id = 0
         print("Note: Using token ID 0 as PAD (miditok 3.x default)")
@@ -264,11 +261,11 @@ def train(args):
         nhead=args.nhead,
         num_encoder_layers=args.num_layers,
         num_decoder_layers=args.num_layers,
+        num_conductor_layers=args.num_conductor_layers,
         latent_dim=args.latent_dim,
         max_seq_len=args.seq_len,
         num_styles=num_styles,
-        num_bar_classes=33,  # Support 0-32 bars
-        num_memory_tokens=args.num_memory_tokens
+        max_bars=args.max_bars
     ).to(device)
 
     # Use Adam (not AdamW) if weight_decay is 0, otherwise use AdamW
@@ -335,15 +332,15 @@ def train(args):
 
         model.train()
 
-        # Cyclic Annealing Schedule
-        # Cycle every 10 epochs (or args.kl_warmup_epochs if provided)
-        cycle_length = args.kl_warmup_epochs if args.kl_warmup_epochs > 0 else 10
-        cycle = epoch // cycle_length
-        epoch_in_cycle = epoch % cycle_length
+        # Monotonic Annealing Schedule
+        # Warmup KL weight from 0 to 1 over kl_warmup_epochs
+        # If kl_warmup_epochs is 0, use a default of 20 epochs for stability
+        warmup_epochs = args.kl_warmup_epochs if args.kl_warmup_epochs > 0 else 20
         
-        # Linear warmup for first 50% of cycle, then stay at 1.0
-        # beta goes from 0 to 1 over cycle_length/2 epochs
-        beta = min(1.0, epoch_in_cycle / (cycle_length * 0.5))
+        if epoch < warmup_epochs:
+            beta = epoch / warmup_epochs
+        else:
+            beta = 1.0
         
         # Linear warmup for learning rate in first few epochs (only if lr_warmup_epochs > 0)
         if args.lr_warmup_epochs > 0 and epoch < args.lr_warmup_epochs:
@@ -574,12 +571,12 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--lr_min", type=float, default=1e-5, help="Minimum learning rate for cosine annealing")
     parser.add_argument("--lr_warmup_epochs", type=int, default=0, help="Number of epochs for LR warmup (0 to disable)")
-    parser.add_argument("--kl_weight", type=float, default=0.02)
-    parser.add_argument("--kl_warmup_epochs", type=int, default=0, help="Number of epochs for KL annealing (0 for full training duration)")
+    parser.add_argument("--kl_weight", type=float, default=0.005)
+    parser.add_argument("--kl_warmup_epochs", type=int, default=30, help="Number of epochs for KL annealing (0 for full training duration)")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay for AdamW")
     parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing factor")
     parser.add_argument("--scheduler_t0", type=int, default=20, help="T_0 for cosine annealing with warm restarts")
-    parser.add_argument("--free_bits", type=float, default=0.1, 
+    parser.add_argument("--free_bits", type=float, default=0.0, 
                         help="Minimum KL divergence per latent dimension (nats)")
     parser.add_argument("--file_limit", type=int, default=None,
                         help="Limit number of files for testing")
@@ -587,8 +584,10 @@ if __name__ == "__main__":
                         help="Gradient clipping threshold")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="Number of data loading workers")
-    parser.add_argument("--num_memory_tokens", type=int, default=8,
-                        help="Number of memory tokens for latent expansion")
+    parser.add_argument("--num_conductor_layers", type=int, default=4,
+                        help="Number of layers in the hierarchical conductor")
+    parser.add_argument("--max_bars", type=int, default=32,
+                        help="Maximum number of bars to support")
     parser.add_argument("--output_dir", type=str, default="checkpoints",
                         help="Directory to save checkpoints and logs")
     parser.add_argument("--save_every", type=int, default=10,
@@ -599,7 +598,7 @@ if __name__ == "__main__":
                         help="Weight for length prediction loss")
     parser.add_argument("--grad_accum_steps", type=int, default=1,
                         help="Number of gradient accumulation steps")
-    parser.add_argument("--word_dropout", type=float, default=0.0,
+    parser.add_argument("--word_dropout", type=float, default=0.3,
                         help="Probability of masking input tokens to decoder")
 
     args = parser.parse_args()

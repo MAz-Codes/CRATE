@@ -37,7 +37,9 @@ def generate(args):
             use_programs=False, # Match dataset config
             use_rests=True,
             use_tempos=True,
-            use_time_signatures=True
+            use_time_signatures=True,
+            use_sustain_pedals=False,
+            use_pitch_bends=False
         )
         tokenizer = REMI(config)
 
@@ -142,7 +144,8 @@ def generate(args):
         num_layers = train_args.get('num_layers', args.num_layers)
         latent_dim = train_args.get('latent_dim', args.latent_dim)
         max_seq_len = train_args.get('seq_len', args.seq_len)
-        num_memory_tokens = train_args.get('num_memory_tokens', 4)  # Default to 4 (new architecture)
+        num_conductor_layers = train_args.get('num_conductor_layers', 4)
+        max_bars = train_args.get('max_bars', 32)
     else:
         print("No training arguments found in checkpoint, using command line arguments.")
         d_model = args.d_model
@@ -150,7 +153,8 @@ def generate(args):
         num_layers = args.num_layers
         latent_dim = args.latent_dim
         max_seq_len = args.seq_len
-        num_memory_tokens = 4  # Default
+        num_conductor_layers = 4
+        max_bars = 32
 
     # Load Model
     model = MusicTransformerVAE(
@@ -159,10 +163,11 @@ def generate(args):
         nhead=nhead,
         num_encoder_layers=num_layers,
         num_decoder_layers=num_layers,
+        num_conductor_layers=num_conductor_layers,
         latent_dim=latent_dim,
         max_seq_len=max_seq_len,
         num_styles=num_styles,
-        num_memory_tokens=num_memory_tokens
+        max_bars=max_bars
     ).to(device)
 
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
