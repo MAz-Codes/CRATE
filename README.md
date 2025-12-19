@@ -1,69 +1,52 @@
-# Drum VAE: Groove MIDI Drum Generator
+# CRATE (Customizeable Rhythm Autoencoder with Transformer Encoding)
 
-A Variational Autoencoder (VAE) for generating drum beats using the Groove MIDI Dataset. The model supports **style conditioning** (funk, rock, jazz, etc.) and **bar count conditioning** (2-32 bars) for controllable drum generation. It is trained on the **Groove MIDI Dataset (GMD)**, a large-scale dataset of human-performed drum grooves.
+A transformer-based Variational Autoencoder that generates multi-bar drum performances with explicit control over musical style, bar lengths and structure. It combines a hierarchical Conductor network with grammar-constrained decoding to produce MIDI drum patterns.
 
-## Features
-- **Drum-Focused Generation**: Specialized in generating MIDI drum patterns.
-- **Style Conditioning**: Condition the generation on specific genres (e.g., Rock, Funk, Jazz, Hip-Hop).
-- **Variational Autoencoder**: Utilizes a latent space to generate diverse and novel beats.
-- **Groove MIDI Dataset**: Integration with TensorFlow Datasets to load high-quality drum performances.
+**This is a work-in-progress and will be updated regularly**
 
-## Setup
+## Key Features
 
-1.  **Clone the repository:**
-    ```bash
-    git clone <repository-url>
-    cd drumVAE
-    ```
+*   **Style & Structure Control**: Generate beats in specific styles (Rock, Funk, Jazz, etc.) with precise bar lengths.
+*   **Advanced Architecture**: Uses Relative Positional Encoding and Bar-Position Aware Decoding for coherent musical structure.
+*   **Robust Training**: Implements auxiliary losses for bar and position prediction to ensure rhythmic accuracy.
 
-2.  **Create a virtual environment:**
-    ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate
-    ```
+## Quick Start
 
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *Note: Ensure you have a GPU-compatible version of PyTorch installed if you plan to train on GPU.*
+The project needs PyTorch. Install the appropriate version (inside the venv) depending on your CUDA version / MPS availablity.
 
-## Usage
-
-### Training
-To train the model from scratch:
-
+### 1. Setup
 ```bash
-python train.py --epochs 100 --batch_size 16 --d_model 512
-```
-The dataset will be automatically downloaded to the `dataset/` folder on the first run.
+# Create environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-### Generate Drum Beats
-
-Generate new drum beats with control over style and length:
-
-```bash
-# 4-bar funk beat
-python generate.py --model_path checkpoints/best_model.pt --style funk --num_bars 4
-
-# 16-bar rock beat
-python generate.py --model_path checkpoints/best_model.pt --style rock --num_bars 16
-
-# 8-bar jazz beat
-python generate.py --model_path checkpoints/best_model.pt --style jazz --num_bars 8
-```
-*   `--style`: Specify a genre (e.g., `rock`, `jazz`, `funk`, `hiphop`).
-*   `--tempo`: (Optional) Target tempo in BPM.
-
-### Evaluation
-To evaluate the model's performance on the test set:
-
-```bash
-python evaluate.py --model_path checkpoints/final_model.pt
+# Install dependencies
+pip install -r requirements.txt
 ```
 
-## Dataset
-This project uses the **Groove MIDI Dataset** (`groove/full-midionly`), managed via TensorFlow Datasets. The data is stored locally in the `dataset/` directory.
+### 2. Train
+Train the model on the Groove MIDI Dataset:
+```bash
+python train.py --epochs 100 --batch_size 16
+```
 
-## License
-[License Information]
+### 3. Generate
+Generate new drum samples:
+```bash
+# Generate a 4-bar Funk beat
+python generate.py --style funk --num_bars 4
+
+# Generate a batch of diverse samples
+python generate_batch.py
+```
+
+## Project Structure
+
+*   `model.py`: The CrateVAE model architecture.
+*   `train.py`: Training script with auxiliary losses.
+*   `generate.py`: Generation script with constrained decoding.
+*   `dataset.py`: Data loading and processing using `miditok`.
+*   `checkpoints/`: Saved model weights and logs.
+*   `samples/`: Generated MIDI files.
+
+
