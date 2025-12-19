@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader
 from dataset import GrooveMidiDataset, DataCollator, STYLES, STYLE_TO_IDX
-from model import MusicTransformerVAE, generate_square_subsequent_mask
+from model import CrateVAE, generate_square_subsequent_mask, TOKEN_TYPE_MAP
 import argparse
 import os
 from tqdm import tqdm
@@ -17,6 +17,108 @@ def evaluate(args):
     else:
         device = torch.device("cpu")
     print(f"Using device: {device}")
+
+
+def get_token_type_targets(token_ids, tokenizer, device):
+    """
+    Extract token type targets for auxiliary loss - GPU accelerated.
+    Returns tensor of shape [seq_len, batch] with type IDs.
+    """
+    # Build lookup table once (vocab_size,) - cached per device
+    cache_key = f'_lookup_cache_{device.type}_{device.index if device.index else 0}'
+    if not hasattr(get_token_type_targets, cache_key):
+        vocab_size = len(tokenizer.vocab)
+        lookup = torch.zeros(vocab_size, dtype=torch.long, device=device)
+        id_to_token = {v: k for k, v in tokenizer.vocab.items()}
+        
+        for token_id, token_str in id_to_token.items():
+            token_str = str(token_str)
+            type_id = 0  # Default PAD
+            for prefix, type_val in TOKEN_TYPE_MAP.items():
+                if token_str.startswith(prefix):
+                    type_id = type_val
+                    break
+            lookup[token_id] = type_id
+        
+        setattr(get_token_type_targets, cache_key, lookup)
+    
+    # GPU lookup - single operation instead of nested loops
+    lookup = getattr(get_token_type_targets, cache_key)
+    type_ids = lookup[token_ids]
+    
+    return type_ids
+
+
+def get_structure_targets(token_ids, tokenizer, device):
+    """
+    Extract bar position targets (0-95) and bar number targets (0-31) - GPU accelerated.
+    Returns:
+        positions: [seq_len, batch]
+        bar_nums: [seq_len, batch]
+    """
+    # Build lookup tables once - cached per device
+    cache_key = f'_cache_{device.type}_{device.index if device.index else 0}'
+    if not hasattr(get_structure_targets, cache_key):
+        vocab_size = len(tokenizer.vocab)
+        id_to_token = {v: k for k, v in tokenizer.vocab.items()}
+        
+        # Precompute which tokens are Bar or Position tokens
+        is_bar_token = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        position_values = torch.zeros(vocab_size, dtype=torch.long, device=device)
+        
+        for token_id, token_str in id_to_token.items():
+            token_str = str(token_str)
+            if token_str.startswith('Bar'):
+                is_bar_token[token_id] = True
+            elif token_str.startswith('Position_'):
+                try:
+                    pos = int(token_str.split('_')[1])
+                    position_values[token_id] = min(pos, 95)
+                except:
+                    pass
+        
+        setattr(get_structure_targets, cache_key, (is_bar_token, position_values))
+    
+    is_bar_token, position_values = getattr(get_structure_targets, cache_key)
+    
+    seq_len, batch_size = token_ids.shape
+    
+    # GPU VECTORIZED operations
+    # Get bar markers and position values for all tokens at once
+    bar_markers = is_bar_token[token_ids]  # [seq_len, batch]
+    pos_vals = position_values[token_ids]  # [seq_len, batch]
+    
+    # Compute bar numbers using cumsum on GPU
+    bar_markers_shifted = torch.cat([torch.zeros(1, batch_size, dtype=torch.long, device=device), 
+                                     bar_markers[:-1].long()], dim=0)
+    bar_nums = torch.cumsum(bar_markers_shifted, dim=0).clamp(max=31)
+    
+    # Forward-fill positions using cummax trick on GPU
+    # We create indices where position tokens occur and use cummax to forward-fill
+    has_pos = pos_vals > 0
+    
+    # Create a sequence index tensor [seq_len, batch]
+    seq_idx = torch.arange(seq_len, device=device).unsqueeze(1).expand(-1, batch_size)
+    
+    # Where we have a position, store the index, otherwise -1
+    pos_indices = torch.where(has_pos, seq_idx, torch.tensor(-1, device=device))
+    
+    # Cummax gives us the index of the last seen position token
+    last_pos_idx, _ = torch.cummax(pos_indices, dim=0)
+    
+    # Gather the position values using the indices
+    # Handle -1 indices (before first position) by clamping to 0
+    gather_idx = last_pos_idx.clamp(min=0)
+    
+    # Flatten for gather operation then reshape
+    batch_offset = torch.arange(batch_size, device=device) * seq_len
+    flat_idx = (gather_idx + batch_offset.unsqueeze(0)).flatten()
+    positions = pos_vals.T.flatten()[flat_idx].reshape(seq_len, batch_size)
+    
+    # Zero out positions before the first position token
+    positions = torch.where(last_pos_idx >= 0, positions, torch.tensor(0, device=device, dtype=positions.dtype))
+    
+    return positions, bar_nums
 
     # Load test dataset
     test_dataset = GrooveMidiDataset(
@@ -59,7 +161,7 @@ def evaluate(args):
     print(f"Vocab size: {vocab_size}, Num styles: {num_styles}")
 
     # Initialize model
-    model = MusicTransformerVAE(
+    model = CrateVAE(
         vocab_size=vocab_size,
         d_model=model_args['d_model'],
         nhead=model_args['nhead'],
@@ -69,7 +171,8 @@ def evaluate(args):
         latent_dim=model_args['latent_dim'],
         max_seq_len=model_args.get('seq_len', args.seq_len),
         num_styles=num_styles,
-        max_bars=model_args.get('max_bars', 32)
+        max_bars=model_args.get('max_bars', 32),
+        num_token_types=10
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -103,6 +206,10 @@ def evaluate(args):
             style_batch = style_batch.to(device)
             bar_batch = bar_batch.to(device)
 
+            # Get token types and structure targets
+            token_types = get_token_type_targets(src, test_dataset.tokenizer, device)
+            positions, bar_nums = get_structure_targets(src, test_dataset.tokenizer, device)
+
             tgt = src
             dec_input = tgt[:-1]
             dec_target = tgt[1:]
@@ -110,12 +217,26 @@ def evaluate(args):
 
             # Create mask for decoder input length
             tgt_seq_len = dec_input.shape[0]
-            tgt_mask = generate_square_subsequent_mask(tgt_seq_len).to(device)
+            tgt_mask = generate_square_subsequent_mask(tgt_seq_len, device)
 
-            logits, mu, logvar, predicted_length = model(src, dec_input, style_id=style_batch, bar_id=bar_batch,
-                                       src_key_padding_mask=src_key_padding_mask,
-                                       tgt_key_padding_mask=dec_padding_mask,
-                                       tgt_mask=tgt_mask)
+            outputs = model(
+                src, dec_input,
+                src_token_types=token_types,
+                tgt_token_types=token_types[:-1],
+                style_id=style_batch,
+                bar_id=bar_batch,
+                src_key_padding_mask=src_key_padding_mask,
+                tgt_key_padding_mask=dec_padding_mask,
+                tgt_mask=tgt_mask,
+                src_bar_pos=positions,
+                src_bar_num=bar_nums,
+                tgt_bar_pos=positions[:-1],
+                tgt_bar_num=bar_nums[:-1]
+            )
+            
+            logits = outputs['logits']
+            mu = outputs['mu']
+            logvar = outputs['logvar']
 
             # Reconstruction loss per token
             token_losses = criterion(
