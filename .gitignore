@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 dataset
-checkpoints/
+generate_batch.py
 samples/
 ._*
-checkpoints_v2/
+checkpoints/

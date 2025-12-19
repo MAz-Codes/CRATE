@@ -1,5 +1,5 @@
 """
-Batch generation script for DrumVAE v2.
+Batch generation script for DrumVAE.
 Generates 40 diverse drum samples across all available genres.
 """
 
@@ -7,8 +7,8 @@ import torch
 import os
 import argparse
 from miditok import REMI, TokenizerConfig
-from model_v2 import DrumVAE
-from generate_v2 import generate_constrained, get_device
+from model import DrumVAE
+from generate import generate_constrained, get_device
 from dataset import STYLES
 import random
 from tqdm import tqdm
@@ -193,8 +193,8 @@ def generate_batch_samples(model_path, output_dir, num_samples=40, max_len=1024)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch generate drum samples with DrumVAE v2")
-    parser.add_argument("--model_path", type=str, default="checkpoints_v2/best_model.pt",
+    parser = argparse.ArgumentParser(description="Batch generate drum samples with DrumVAE")
+    parser.add_argument("--model_path", type=str, default="checkpoints/best_model.pt",
                        help="Path to trained model checkpoint")
     parser.add_argument("--output_dir", type=str, default="samples/batch_generation",
                        help="Directory to save generated samples")
