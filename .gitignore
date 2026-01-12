@@ -1,8 +1,9 @@
 .venv/
 __pycache__/
+checkpoints/
+00_documentation/
+samples/
 *.pyc
 dataset
-generate_batch.py
-samples/
+batch_generate.py
 ._*
-checkpoints/

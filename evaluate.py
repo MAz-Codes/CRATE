@@ -8,23 +8,11 @@ from tqdm import tqdm
 import json
 import numpy as np
 
-
-def evaluate(args):
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device}")
-
-
 def get_token_type_targets(token_ids, tokenizer, device):
     """
     Extract token type targets for auxiliary loss - GPU accelerated.
     Returns tensor of shape [seq_len, batch] with type IDs.
     """
-    # Build lookup table once (vocab_size,) - cached per device
     cache_key = f'_lookup_cache_{device.type}_{device.index if device.index else 0}'
     if not hasattr(get_token_type_targets, cache_key):
         vocab_size = len(tokenizer.vocab)
@@ -33,7 +21,7 @@ def get_token_type_targets(token_ids, tokenizer, device):
         
         for token_id, token_str in id_to_token.items():
             token_str = str(token_str)
-            type_id = 0  # Default PAD
+            type_id = 0
             for prefix, type_val in TOKEN_TYPE_MAP.items():
                 if token_str.startswith(prefix):
                     type_id = type_val
@@ -42,12 +30,10 @@ def get_token_type_targets(token_ids, tokenizer, device):
         
         setattr(get_token_type_targets, cache_key, lookup)
     
-    # GPU lookup - single operation instead of nested loops
     lookup = getattr(get_token_type_targets, cache_key)
     type_ids = lookup[token_ids]
     
     return type_ids
-
 
 def get_structure_targets(token_ids, tokenizer, device):
     """
@@ -56,13 +42,11 @@ def get_structure_targets(token_ids, tokenizer, device):
         positions: [seq_len, batch]
         bar_nums: [seq_len, batch]
     """
-    # Build lookup tables once - cached per device
     cache_key = f'_cache_{device.type}_{device.index if device.index else 0}'
     if not hasattr(get_structure_targets, cache_key):
         vocab_size = len(tokenizer.vocab)
         id_to_token = {v: k for k, v in tokenizer.vocab.items()}
         
-        # Precompute which tokens are Bar or Position tokens
         is_bar_token = torch.zeros(vocab_size, dtype=torch.bool, device=device)
         position_values = torch.zeros(vocab_size, dtype=torch.long, device=device)
         
@@ -83,48 +67,43 @@ def get_structure_targets(token_ids, tokenizer, device):
     
     seq_len, batch_size = token_ids.shape
     
-    # GPU VECTORIZED operations
-    # Get bar markers and position values for all tokens at once
-    bar_markers = is_bar_token[token_ids]  # [seq_len, batch]
-    pos_vals = position_values[token_ids]  # [seq_len, batch]
+    bar_markers = is_bar_token[token_ids]
+    pos_vals = position_values[token_ids]
     
-    # Compute bar numbers using cumsum on GPU
     bar_markers_shifted = torch.cat([torch.zeros(1, batch_size, dtype=torch.long, device=device), 
                                      bar_markers[:-1].long()], dim=0)
     bar_nums = torch.cumsum(bar_markers_shifted, dim=0).clamp(max=31)
     
-    # Forward-fill positions using cummax trick on GPU
-    # We create indices where position tokens occur and use cummax to forward-fill
     has_pos = pos_vals > 0
     
-    # Create a sequence index tensor [seq_len, batch]
     seq_idx = torch.arange(seq_len, device=device).unsqueeze(1).expand(-1, batch_size)
     
-    # Where we have a position, store the index, otherwise -1
     pos_indices = torch.where(has_pos, seq_idx, torch.tensor(-1, device=device))
     
-    # Cummax gives us the index of the last seen position token
     last_pos_idx, _ = torch.cummax(pos_indices, dim=0)
     
-    # Gather the position values using the indices
-    # Handle -1 indices (before first position) by clamping to 0
     gather_idx = last_pos_idx.clamp(min=0)
     
-    # Flatten for gather operation then reshape
     batch_offset = torch.arange(batch_size, device=device) * seq_len
     flat_idx = (gather_idx + batch_offset.unsqueeze(0)).flatten()
     positions = pos_vals.T.flatten()[flat_idx].reshape(seq_len, batch_size)
     
-    # Zero out positions before the first position token
     positions = torch.where(last_pos_idx >= 0, positions, torch.tensor(0, device=device, dtype=positions.dtype))
     
     return positions, bar_nums
 
-    # Load test dataset
+def evaluate(args):
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
+
     test_dataset = GrooveMidiDataset(
         split='test', max_seq_len=args.seq_len)
 
-    # Get PAD token ID - use 0 as default for miditok 3.x
     try:
         pad_token_id = test_dataset.tokenizer["PAD_None"]
     except:
@@ -138,7 +117,6 @@ def get_structure_targets(token_ids, tokenizer, device):
 
     print(f"Loaded {len(test_dataset)} test samples")
 
-    # Load checkpoint
     if not os.path.exists(args.model_path):
         raise FileNotFoundError(f"Model not found at {args.model_path}")
 
@@ -150,7 +128,6 @@ def get_structure_targets(token_ids, tokenizer, device):
     if vocab_size is None:
         raise ValueError("Checkpoint missing 'vocab_size'. Cannot load model.")
 
-    # Verify dataset tokenizer matches checkpoint
     dataset_vocab_size = len(test_dataset.tokenizer)
     if dataset_vocab_size != vocab_size:
         print(
@@ -160,7 +137,6 @@ def get_structure_targets(token_ids, tokenizer, device):
     print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
     print(f"Vocab size: {vocab_size}, Num styles: {num_styles}")
 
-    # Initialize model
     model = CrateVAE(
         vocab_size=vocab_size,
         d_model=model_args['d_model'],
@@ -178,19 +154,16 @@ def get_structure_targets(token_ids, tokenizer, device):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
-    # Use PAD token ID from checkpoint if available
     pad_token_id = checkpoint.get('pad_token_id', 0)
     criterion = torch.nn.CrossEntropyLoss(
         ignore_index=pad_token_id, reduction='none')
 
-    # Evaluation metrics
     total_loss = 0
     total_recon_loss = 0
     total_kl_loss = 0
     total_tokens = 0
     correct_tokens = 0
 
-    # Style-specific metrics
     style_losses = {style: [] for style in STYLES}
     style_losses['unknown'] = []
 
@@ -206,7 +179,6 @@ def get_structure_targets(token_ids, tokenizer, device):
             style_batch = style_batch.to(device)
             bar_batch = bar_batch.to(device)
 
-            # Get token types and structure targets
             token_types = get_token_type_targets(src, test_dataset.tokenizer, device)
             positions, bar_nums = get_structure_targets(src, test_dataset.tokenizer, device)
 
@@ -215,7 +187,6 @@ def get_structure_targets(token_ids, tokenizer, device):
             dec_target = tgt[1:]
             dec_padding_mask = src_key_padding_mask[:, :-1]
 
-            # Create mask for decoder input length
             tgt_seq_len = dec_input.shape[0]
             tgt_mask = generate_square_subsequent_mask(tgt_seq_len, device)
 
@@ -238,17 +209,14 @@ def get_structure_targets(token_ids, tokenizer, device):
             mu = outputs['mu']
             logvar = outputs['logvar']
 
-            # Reconstruction loss per token
             token_losses = criterion(
                 logits.reshape(-1, vocab_size), dec_target.reshape(-1))
             recon_loss = token_losses.mean()
 
-            # KL Divergence: average over batch and latent dimensions
             kl_loss = -0.5 * \
                 torch.mean(
                     torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
 
-            # Token accuracy (non-padded tokens)
             predictions = logits.argmax(dim=-1)
             non_pad_mask = (dec_target != pad_token_id)
             correct_tokens += ((predictions == dec_target)
@@ -258,7 +226,6 @@ def get_structure_targets(token_ids, tokenizer, device):
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
 
-            # Track per-style losses
             for i, style_id in enumerate(style_batch.cpu().numpy()):
                 if style_id < len(STYLES):
                     style_name = STYLES[style_id]
@@ -266,7 +233,6 @@ def get_structure_targets(token_ids, tokenizer, device):
                     style_name = 'unknown'
                 style_losses[style_name].append(recon_loss.item())
 
-    # Compute final metrics
     num_batches = len(test_loader)
     avg_recon_loss = total_recon_loss / num_batches
     avg_kl_loss = total_kl_loss / num_batches
@@ -274,7 +240,6 @@ def get_structure_targets(token_ids, tokenizer, device):
     token_accuracy = (correct_tokens / total_tokens) * \
         100 if total_tokens > 0 else 0
 
-    # Compute per-style statistics
     style_stats = {}
     for style, losses in style_losses.items():
         if len(losses) > 0:
@@ -284,7 +249,6 @@ def get_structure_targets(token_ids, tokenizer, device):
                 'num_samples': len(losses)
             }
 
-    # Print results
     print("\n" + "="*60)
     print("EVALUATION RESULTS")
     print("="*60)
@@ -307,7 +271,6 @@ def get_structure_targets(token_ids, tokenizer, device):
         print(
             f"  {'unknown':12s}: Loss={stats['avg_loss']:.4f} ±{stats['std_loss']:.4f} (n={stats['num_samples']})")
 
-    # Save results to JSON
     results = {
         'reconstruction_loss': avg_recon_loss,
         'kl_divergence': avg_kl_loss,
@@ -328,7 +291,6 @@ def get_structure_targets(token_ids, tokenizer, device):
     print("="*60)
 
     return results
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

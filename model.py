@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-
 class RelativePositionalEncoding(nn.Module):
 
     def __init__(self, d_model, dropout=0.1, max_len=512):
@@ -34,7 +33,6 @@ class RelativePositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         self.pe = pe.unsqueeze(0).transpose(0, 1)
 
-
 class TokenTypeEmbedding(nn.Module):
     """
     Learns separate embeddings for different token types in REMI:
@@ -43,11 +41,9 @@ class TokenTypeEmbedding(nn.Module):
     def __init__(self, d_model, num_types=8):
         super().__init__()
         self.type_embedding = nn.Embedding(num_types, d_model)
-        # Token type IDs: 0=PAD, 1=Bar, 2=Position, 3=Pitch, 4=Velocity, 5=Duration, 6=Tempo, 7=TimeSig, 8=Rest
         
     def forward(self, token_types):
         return self.type_embedding(token_types)
-
 
 class MusicalPositionEncoding(nn.Module):
     def __init__(self, d_model, max_bar_position=96, max_bars=32):
@@ -65,7 +61,6 @@ class MusicalPositionEncoding(nn.Module):
         bar_emb = self.bar_number_emb(bar_numbers)
         combined = torch.cat([pos_emb, bar_emb], dim=-1)
         return self.proj(combined)
-
 
 class CrateVAE(nn.Module):
     def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=6,
@@ -111,10 +106,9 @@ class CrateVAE(nn.Module):
         
         self.output_proj = nn.Linear(d_model, vocab_size)
         
-        self.token_type_head = nn.Linear(d_model, num_token_types)  # Predict next token type
-        self.bar_position_head = nn.Linear(d_model, 96)  # Predict position within bar
+        self.token_type_head = nn.Linear(d_model, num_token_types)
+        self.bar_position_head = nn.Linear(d_model, 96)
         
-        # Length prediction
         self.length_predictor = nn.Sequential(
             nn.Linear(latent_dim + d_model, 256),
             nn.GELU(),
@@ -150,39 +144,30 @@ class CrateVAE(nn.Module):
         """
         batch_size = src.size(1)
         
-        # Token embeddings
         x = self.token_embedding(src) * math.sqrt(self.d_model)
         
-        # Add token type embeddings if provided
         if token_types is not None:
             x = x + self.token_type_embedding(token_types)
             
-        # Add musical position encoding if provided
         if bar_pos is not None and bar_num is not None:
             x = x + self.musical_pos_encoder(bar_pos, bar_num)
         
-        # Positional encoding
         x = self.pos_encoder(x)
         
-        # Prepend [CLS] token
         cls_tokens = self.cls_token.expand(1, batch_size, -1)
         x = torch.cat([cls_tokens, x], dim=0)
         
-        # Update padding mask for [CLS]
         if src_key_padding_mask is not None:
             cls_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=src.device)
             src_key_padding_mask = torch.cat([cls_mask, src_key_padding_mask], dim=1)
         
-        # Add style embedding
         if style_id is not None:
             style_emb = self.style_embedding(style_id).unsqueeze(0)
             x = x + style_emb
         
-        # Encode
         encoded = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
         
-        # Extract [CLS] representation
-        cls_output = encoded[0]  # [batch, d_model]
+        cls_output = encoded[0]
         
         mu = self.fc_mu(cls_output)
         logvar = self.fc_logvar(cls_output)
@@ -195,13 +180,11 @@ class CrateVAE(nn.Module):
 
         batch_size = z.size(0)
         
-        # Latent dropout (for training)
         if use_latent_dropout and self.training:
             dropout_mask = torch.bernoulli(torch.full_like(z, 0.5))
             z = z * dropout_mask * 2.0
         
-        # === CONDUCTOR ===
-        z_emb = self.z_to_conductor(z).unsqueeze(0)  # [1, batch, d_model]
+        z_emb = self.z_to_conductor(z).unsqueeze(0)
         queries = self.bar_queries.expand(-1, batch_size, -1)
         z_expanded = z_emb.expand(self.max_bars, -1, -1)
         
@@ -214,37 +197,28 @@ class CrateVAE(nn.Module):
             
         bar_embeddings = self.conductor(conductor_input)
         
-        # Memory mask for bar count
         memory_mask = None
         if bar_id is not None:
             memory_mask = torch.arange(self.max_bars, device=z.device).expand(batch_size, -1) >= bar_id.unsqueeze(1)
         
-        # === DECODER ===
         tgt_emb = self.token_embedding(tgt) * math.sqrt(self.d_model)
         
-        # Add token type embeddings
         if token_types is not None:
             tgt_emb = tgt_emb + self.token_type_embedding(token_types)
             
-        # Add musical position encoding if provided
         if bar_pos is not None and bar_num is not None:
             tgt_emb = tgt_emb + self.musical_pos_encoder(bar_pos, bar_num)
         
-        # Add latent to all positions (strong conditioning)
         tgt_emb = tgt_emb + z_emb
         
-        # Add style
         if style_id is not None:
             tgt_emb = tgt_emb + self.style_embedding(style_id).unsqueeze(0)
         
-        # Add bar count
         if bar_id is not None:
             tgt_emb = tgt_emb + self.bar_count_embedding(bar_id).unsqueeze(0)
         
-        # Positional encoding
         tgt_emb = self.pos_encoder(tgt_emb)
         
-        # Decode
         decoded = self.decoder(
             tgt_emb, bar_embeddings,
             tgt_mask=tgt_mask,
@@ -252,7 +226,6 @@ class CrateVAE(nn.Module):
             memory_key_padding_mask=memory_mask
         )
         
-        # Output projections
         logits = self.output_proj(decoded)
         type_logits = self.token_type_head(decoded)
         position_logits = self.bar_position_head(decoded)
@@ -272,14 +245,11 @@ class CrateVAE(nn.Module):
             src_token_types: [seq_len, batch] - token types for encoder
             tgt_token_types: [seq_len-1, batch] - token types for decoder
         """
-        # Encode (uses src and src_token_types)
         mu, logvar = self.encode(src, src_token_types, style_id, src_key_padding_mask,
                                  bar_pos=src_bar_pos, bar_num=src_bar_num)
         
-        # Reparameterize
         z = self.reparameterize(mu, logvar)
         
-        # Length prediction
         if bar_id is not None:
             bar_emb = self.bar_count_embedding(bar_id)
             length_input = torch.cat([z, bar_emb], dim=1)
@@ -287,7 +257,6 @@ class CrateVAE(nn.Module):
         else:
             predicted_length = None
         
-        # Decode (uses tgt and tgt_token_types)
         logits, type_logits, position_logits = self.decode(
             z, tgt, tgt_token_types, style_id, bar_id,
             tgt_key_padding_mask, tgt_mask,
@@ -305,23 +274,19 @@ class CrateVAE(nn.Module):
             'z': z
         }
 
-
 def generate_square_subsequent_mask(sz, device=None):
-    """Generate causal mask for autoregressive decoding."""
     if device is None:
         device = torch.device('cpu')
     mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
     mask = mask.masked_fill(mask == 1, float('-inf'))
     return mask
 
-
-# Token type mapping for REMI tokenizer
 TOKEN_TYPE_MAP = {
     'PAD': 0,
     'Bar': 1,
     'Position': 2,
     'Pitch': 3,
-    'PitchDrum': 3,  # Same as Pitch
+    'PitchDrum': 3,
     'Velocity': 4,
     'Duration': 5,
     'Tempo': 6,
@@ -330,7 +295,6 @@ TOKEN_TYPE_MAP = {
     'BOS': 9,
     'EOS': 9,
 }
-
 
 def get_token_types(token_ids, tokenizer):
     """
@@ -343,7 +307,6 @@ def get_token_types(token_ids, tokenizer):
     Returns:
         [seq_len, batch] tensor of token type IDs
     """
-    # Build reverse vocab
     id_to_token = {v: k for k, v in tokenizer.vocab.items()}
     
     device = token_ids.device
@@ -355,8 +318,7 @@ def get_token_types(token_ids, tokenizer):
             tid = token_ids[s, b].item()
             token_str = str(id_to_token.get(tid, 'PAD'))
             
-            # Determine type from token string
-            type_id = 0  # Default to PAD
+            type_id = 0
             for prefix, tid_val in TOKEN_TYPE_MAP.items():
                 if token_str.startswith(prefix):
                     type_id = tid_val
@@ -365,8 +327,3 @@ def get_token_types(token_ids, tokenizer):
             type_ids[s, b] = type_id
     
     return type_ids
-
-
-# Keep backward compatibility with old model names
-MusicTransformerVAE = CrateVAE
-DrumVAE = CrateVAE

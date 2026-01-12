@@ -1,7 +1,3 @@
-"""
-Generation script for CrateVAE with constrained decoding for musical structure.
-"""
-
 import torch
 import torch.nn.functional as F
 import argparse
@@ -9,15 +5,13 @@ import os
 from miditok import REMI, TokenizerConfig
 from model import CrateVAE, generate_square_subsequent_mask, TOKEN_TYPE_MAP
 
-
-# REMI token type patterns - enforces grammar
 VALID_NEXT_TYPES = {
     'Bar': ['Position', 'TimeSig', 'Tempo'],
-    'Position': ['Pitch', 'PitchDrum', 'Rest'],
+    'Position': ['Pitch', 'PitchDrum'],
     'Pitch': ['Velocity'],
     'PitchDrum': ['Velocity'],
     'Velocity': ['Duration'],
-    'Duration': ['Position', 'Pitch', 'PitchDrum', 'Rest', 'Bar'],
+    'Duration': ['Position', 'Pitch', 'PitchDrum', 'Bar'],
     'Tempo': ['Position', 'Pitch', 'PitchDrum'],
     'TimeSig': ['Position', 'Tempo'],
     'Rest': ['Position', 'Bar'],
@@ -26,18 +20,14 @@ VALID_NEXT_TYPES = {
     'PAD': ['Bar', 'Position'],
 }
 
-
 def get_token_type(token_str):
-    """Extract token type from token string."""
     token_str = str(token_str)
-    # Check PitchDrum before Pitch to avoid false match
     if token_str.startswith('PitchDrum'):
         return 'PitchDrum'
     for prefix in TOKEN_TYPE_MAP.keys():
         if token_str.startswith(prefix):
             return prefix
     return 'PAD'
-
 
 def create_type_mask(prev_type, vocab, id_to_token, device):
     """
@@ -56,7 +46,6 @@ def create_type_mask(prev_type, vocab, id_to_token, device):
             mask[token_id] = 0.0
     
     return mask
-
 
 def get_structure_info(token_ids, id_to_token, device):
     """
@@ -89,11 +78,10 @@ def get_structure_info(token_ids, id_to_token, device):
         
     return positions, bar_nums
 
-
 def get_token_types_for_seq(token_ids, id_to_token, device):
     """
     Compute token type IDs for the generated sequence.
-    This ensures train/test consistency for the decoder's token type embeddings.
+    ensures train/test consistency for the decoder's token type embeddings.
     """
     seq_len = token_ids.size(0)
     type_ids = torch.zeros_like(token_ids)
@@ -101,9 +89,8 @@ def get_token_types_for_seq(token_ids, id_to_token, device):
     for s in range(seq_len):
         tid = token_ids[s, 0].item()
         token_str = str(id_to_token.get(tid, ''))
-        type_id = 0  # Default: PAD/unknown
+        type_id = 0
         
-        # Check PitchDrum before Pitch to avoid false match
         if token_str.startswith('PitchDrum'):
             type_id = TOKEN_TYPE_MAP.get('PitchDrum', 3)
         else:
@@ -116,7 +103,6 @@ def get_token_types_for_seq(token_ids, id_to_token, device):
     
     return type_ids
 
-
 def generate_constrained(model, tokenizer, z, style_id, bar_id, device, 
                          max_len=512, temperature=0.9, top_k=50, top_p=0.95):
     """
@@ -127,7 +113,6 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
     vocab = tokenizer.vocab
     id_to_token = {v: k for k, v in vocab.items()}
     
-    # Start with BOS or first valid token
     try:
         start_token = tokenizer["BOS_None"]
         if isinstance(start_token, list):
@@ -138,7 +123,6 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
     generated = torch.tensor([[start_token]], dtype=torch.long, device=device)
     prev_type = 'BOS'
     
-    # Track bar structure
     current_bar = 0
     current_position = 0
     notes_in_bar = 0
@@ -149,13 +133,10 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
             seq_len = generated.size(0)
             tgt_mask = generate_square_subsequent_mask(seq_len, device)
             
-            # Get structure info
             positions, bar_nums = get_structure_info(generated, id_to_token, device)
             
-            # Get token types for decoder (ensures train/test consistency)
             token_types = get_token_types_for_seq(generated, id_to_token, device)
             
-            # Decode
             logits, type_logits, _ = model.decode(
                 z, generated, 
                 token_types=token_types,
@@ -166,49 +147,38 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
                 bar_num=bar_nums
             )
             
-            # Get last token logits
-            last_logits = logits[-1, 0, :]  # [vocab_size]
-            last_type_logits = type_logits[-1, 0, :]  # [num_types]
+            last_logits = logits[-1, 0, :]
+            last_type_logits = type_logits[-1, 0, :]
             
-            # Apply temperature
             last_logits = last_logits / temperature
             
-            # Create grammar mask
             grammar_mask = create_type_mask(prev_type, vocab, id_to_token, device)
             
-            # Apply grammar constraints
             last_logits = last_logits + grammar_mask
             
-            # Force Bar token if we've gone too long without one (prevent infinite bars)
-            # A typical dense drum bar is ~30-60 tokens. 128 is a safe upper limit.
             tokens_since_last_bar = step - last_bar_step if 'last_bar_step' in locals() else step
             if tokens_since_last_bar > 128 and current_bar < target_bars:
-                 # Boost Bar token probability significantly to force a bar change
                 bar_token_ids = [tid for tid, tok in id_to_token.items() if 'Bar' in str(tok)]
                 for tid in bar_token_ids:
                     last_logits[tid] += 10.0
             
-            # Force position progression within bar
             if prev_type == 'Duration' and notes_in_bar > 0:
-                # Prefer positions that are >= current_position
                 for tid, tok in id_to_token.items():
                     tok_str = str(tok)
                     if tok_str.startswith('Position_'):
                         try:
                             pos = int(tok_str.split('_')[1])
                             if pos < current_position:
-                                last_logits[tid] -= 3.0  # Penalize backward positions
+                                last_logits[tid] -= 3.0
                             elif pos == current_position:
-                                last_logits[tid] += 1.0  # Slight boost for same position (chord)
+                                last_logits[tid] += 1.0
                         except:
                             pass
             
-            # Top-k filtering
             if top_k > 0:
                 indices_to_remove = last_logits < torch.topk(last_logits, top_k)[0][..., -1, None]
                 last_logits[indices_to_remove] = float('-inf')
             
-            # Top-p (nucleus) filtering
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(last_logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -221,12 +191,9 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
                     0, sorted_indices, sorted_indices_to_remove)
                 last_logits[indices_to_remove] = float('-inf')
             
-            # Sample
             probs = F.softmax(last_logits, dim=-1)
             
-            # Handle all -inf case
             if torch.all(probs == 0) or torch.any(torch.isnan(probs)):
-                # Fallback: sample from valid tokens only
                 valid_mask = grammar_mask == 0
                 if valid_mask.any():
                     uniform_probs = torch.zeros_like(probs)
@@ -239,11 +206,9 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
             next_token = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
             generated = torch.cat([generated, next_token], dim=0)
             
-            # Update state
             token_str = str(id_to_token.get(next_token_id, ''))
             prev_type = get_token_type(token_str)
             
-            # Track musical structure
             if prev_type == 'Bar':
                 current_bar += 1
                 current_position = 0
@@ -257,10 +222,7 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
             elif prev_type in ['Pitch', 'PitchDrum']:
                 notes_in_bar += 1
             
-            # Stop conditions
-            # We want to complete the Nth bar, so we stop when we see the start of the (N+1)th bar
             if current_bar > target_bars:
-                # Remove the last token (the extra Bar token) and break
                 generated = generated[:-1]
                 break
             
@@ -274,37 +236,29 @@ def generate_constrained(model, tokenizer, z, style_id, bar_id, device,
     
     return generated.squeeze().cpu().tolist()
 
-
 def get_device():
-    """Get the best available device (CUDA > MPS > CPU)."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
-
 def main(args):
-    # Device - prioritize GPU (CUDA > MPS > CPU)
     device = get_device()
     print(f"Using device: {device}")
     
-    # Optimize for GPU inference
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     
-    # Load tokenizer from checkpoint directory (ensures vocabulary consistency)
     checkpoint_dir = os.path.dirname(args.model_path)
     tokenizer_path = os.path.join(checkpoint_dir, 'tokenizer.json')
     
     if os.path.exists(tokenizer_path):
         print(f"Loading tokenizer from {checkpoint_dir}")
         try:
-            # Try the new miditok API first
             tokenizer = REMI(params=tokenizer_path)
         except (TypeError, Exception):
-            # Fallback: create fresh tokenizer with same config
             print("Note: Using fresh tokenizer configuration")
             config = TokenizerConfig(
                 num_velocities=16, use_chords=False, use_programs=False,
@@ -321,7 +275,6 @@ def main(args):
         )
         tokenizer = REMI(config)
     
-    # Load model
     print(f"Loading model from {args.model_path}")
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
     train_args = checkpoint.get('args', {})
@@ -344,7 +297,6 @@ def main(args):
     model.eval()
     print("Model loaded successfully")
     
-    # Style mapping
     from dataset import STYLES, STYLE_TO_IDX, UNKNOWN_STYLE_IDX
     
     style_name = args.style.lower()
@@ -359,10 +311,8 @@ def main(args):
     
     print(f"Generating {args.num_bars}-bar {args.style} beat...")
     
-    # Sample latent
     z = torch.randn(1, train_args.get('latent_dim', 256), device=device)
     
-    # Generate with constraints
     tokens = generate_constrained(
         model, tokenizer, z, style_tensor, bar_tensor, device,
         max_len=args.max_len,
@@ -373,8 +323,6 @@ def main(args):
     
     print(f"Generated {len(tokens)} tokens")
     
-    # Check if we actually reached the target number of bars
-    # Count 'Bar' tokens in the output
     id_to_token = {v: k for k, v in tokenizer.vocab.items()}
     bar_count = sum(1 for t in tokens if 'Bar' in str(id_to_token.get(t, '')))
     print(f"Generated {bar_count} bars (Target: {args.num_bars})")
@@ -382,30 +330,31 @@ def main(args):
     if bar_count < args.num_bars:
         print(f"Warning: Sequence truncated at {len(tokens)} tokens (max_len={args.max_len}).")
         print("Try increasing --max_len if you want more bars.")
-
-    # Decode to MIDI
+    
     try:
         score = tokenizer.decode([tokens])
         
-        # Ensure output directory exists
+        tracks = getattr(score, 'tracks', getattr(score, 'instruments', []))
+        for track in tracks:
+            track.is_drum = True
+            if hasattr(track, 'channel'):
+                track.channel = 9
+        
         os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
         
         score.dump_midi(args.output)
         print(f"✓ Saved to {args.output}")
         
-        # Print summary
         total_notes = sum(len(t.notes) for t in score.tracks)
         duration = score.end() / score.ticks_per_quarter if score.ticks_per_quarter > 0 else 0
         print(f"  Notes: {total_notes}, Duration: {duration:.1f} beats")
         
     except Exception as e:
         print(f"Error decoding MIDI: {e}")
-        # Save tokens for debugging
         import json
         with open(args.output + '.tokens.json', 'w') as f:
             json.dump(tokens, f)
         print(f"Saved raw tokens to {args.output}.tokens.json")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate drums with CrateVAE")
