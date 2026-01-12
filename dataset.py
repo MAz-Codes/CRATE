@@ -95,13 +95,16 @@ class GrooveMidiDataset(Dataset):
                     if (end - start) < ticks_per_bar:
                         continue
                     
+                    # Calculate actual bar count from tick range
+                    actual_bars = max(1, min((end - start) // ticks_per_bar, self.chunk_bars))
                     
                     self.examples.append({
                         'score': score,
                         'start_tick': start,
                         'end_tick': end,
                         'style_id': style_id,
-                        'num_bars': self.chunk_bars,
+                        'num_bars': actual_bars,
+                        'ticks_per_bar': ticks_per_bar,  # Store for augmentation
                         'id': f"{row['id']}_chunk_{i//chunk_ticks}"
                     })
                     
@@ -147,9 +150,20 @@ class GrooveMidiDataset(Dataset):
     def __getitem__(self, idx):
         meta = self.examples[idx]
         
-        clipped_score = meta['score'].clip(meta['start_tick'], meta['end_tick'])
+        actual_bars = meta['num_bars']
+        start_tick = meta['start_tick']
+        end_tick = meta['end_tick']
+        ticks_per_bar = meta.get('ticks_per_bar', 480 * 4)  # Fallback for old data
         
-        shifted_score = clipped_score.shift_time(-meta['start_tick'])
+        # Bar count augmentation: randomly truncate to fewer bars during training
+        if self.augment and actual_bars > 2 and random.random() < 0.3:
+            target_bars = random.randint(2, actual_bars)
+            end_tick = start_tick + (target_bars * ticks_per_bar)
+            actual_bars = target_bars
+        
+        clipped_score = meta['score'].clip(start_tick, end_tick)
+        
+        shifted_score = clipped_score.shift_time(-start_tick)
         
         if self.augment:
             self.apply_augmentation(shifted_score)
@@ -178,7 +192,7 @@ class GrooveMidiDataset(Dataset):
         return (
             torch.tensor(token_ids, dtype=torch.long), 
             torch.tensor(meta['style_id'], dtype=torch.long), 
-            torch.tensor(meta['num_bars'], dtype=torch.long)
+            torch.tensor(actual_bars, dtype=torch.long)
         )
 
 class DataCollator:
